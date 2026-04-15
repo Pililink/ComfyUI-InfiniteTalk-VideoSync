@@ -1,6 +1,20 @@
 # ComfyUI-InfiniteTalk-VideoSync 依赖
-# 大部分依赖已由 ComfyUI 和 WanVideoWrapper 安装
+# 当前仓库已内置 WanVideo / InfiniteTalk runtime，不再依赖外部 ComfyUI-WanVideoWrapper 安装
 
 torch>=2.0.0
+torchaudio
 numpy
 imageio-ffmpeg
+ftfy
+accelerate>=1.2.1
+einops
+diffusers>=0.33.0
+peft>=0.17.0
+sentencepiece>=0.2.0
+protobuf
+pyloudnorm
+gguf>=0.17.1
+opencv-python
+scipy
+transformers
+huggingface_hub

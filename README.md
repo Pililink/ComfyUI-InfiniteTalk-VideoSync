@@ -82,7 +82,7 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-InfiniteTalk-VideoSync.git
 ```
 
 ### 前置依赖
-- [ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) (必须)
+- 无需额外安装 `ComfyUI-WanVideoWrapper`，当前仓库已内置运行时
 - ffmpeg (系统 PATH 中可用)
 - 所有 InfiniteTalk 模型文件
 
@@ -114,17 +114,18 @@ git clone https://github.com/YOUR_USERNAME/ComfyUI-InfiniteTalk-VideoSync.git
 
 ## 项目状态
 
-⚠️ **开发中** — 核心框架和节点接口已完成，`infinitetalk_runtime.py` 中的模型调用需要根据你本地的 WanVideoWrapper 版本适配。
+⚠️ **Beta** — 当前仓库已内置 WanVideo / InfiniteTalk 运行时，不再依赖外部安装 `ComfyUI-WanVideoWrapper`，但仍需要在你的 ComfyUI 运行环境里做一次实机验证。
 
 ### 需要完成的工作
 
-1. **模型加载适配**: `infinitetalk_runtime.py` 中的 `_load_models()` 需要根据你的 WanVideoWrapper 版本调整导入路径和函数签名
-2. **音频特征切片**: 需要验证 `multitalk_embeds` 的内部结构，确保按偏移切片时音频特征正确对齐
-3. **段间重叠处理**: 需要确认 `process_segment` 返回的帧是否已经由内部 multitalk_loop 去掉了重叠区
-4. **测试**: 在实际环境中测试内存占用、显存占用、输出质量
+1. **实机回归**: 在你的 ComfyUI 环境里跑一条真实视频，确认内置 runtime 与本机模型目录、模型文件名兼容
+2. **参数收敛**: 根据素材类型微调 `segment_seconds / motion_frame / start_step`
+3. **质量验证**: 对比旧工作流的动作一致性、口型同步和段间连续性
 
 ## 致谢
 
 - [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) — 核心推理引擎
 - [MeiGen-AI/InfiniteTalk](https://github.com/MeiGen-AI/InfiniteTalk) — InfiniteTalk 模型
 - [Pililink/ComfyUI-Pililink-LatentSyncWrapper](https://github.com/Pililink/ComfyUI-Pililink-LatentSyncWrapper) — 节点设计模式参考
+
+本仓库 `vendor/wanvideo_wrapper` 内嵌了 WanVideoWrapper 所需运行时代码，遵循其 Apache 2.0 许可证。

@@ -1,0 +1,6 @@
+# ComfyUI-InfiniteTalk-VideoSync 依赖
+# 大部分依赖已由 ComfyUI 和 WanVideoWrapper 安装
+
+torch>=2.0.0
+numpy
+imageio-ffmpeg

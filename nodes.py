@@ -1279,9 +1279,9 @@ class InfiniteTalkVideoSyncPreview:
         return {
             "required": {
                 "video_path": ("STRING", {"default": ""}),
-                "segment_seconds": ("FLOAT", {"default": 20.0}),
-                "target_fps": ("FLOAT", {"default": 25.0}),
-                "motion_frame": ("INT", {"default": 9}),
+                "segment_seconds": ("FLOAT", {"default": 20.0, "min": 4.0, "max": 3600.0, "step": 1.0}),
+                "target_fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 1000.0, "step": 0.1}),
+                "motion_frame": ("INT", {"default": 9, "min": 1, "max": 256, "step": 1}),
             }
         }
 
@@ -1297,9 +1297,10 @@ class InfiniteTalkVideoSyncPreview:
             return (0, 0, 0.0, 0.0, 0, str(exc))
 
         info = get_video_info(resolved_video_path)
-        total_frames = max(1, int(info["duration"] * float(target_fps)))
-        segment_frames = max(int(float(segment_seconds) * float(target_fps)), 81)
-        stride = segment_frames - int(motion_frame)
+        target_fps = max(1.0, float(target_fps))
+        total_frames = max(1, int(info["duration"] * target_fps))
+        segment_frames = max(int(float(segment_seconds) * target_fps), 81)
+        stride = max(1, segment_frames - int(motion_frame))
         num_segments = max(1, int(math.ceil(max(total_frames - segment_frames, 0) / float(stride))) + 1)
 
         ram_per_segment_mb = (

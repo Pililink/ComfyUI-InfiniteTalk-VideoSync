@@ -397,6 +397,12 @@ class InfiniteTalkEngine:
 
         actual_num_frames = max(1, int(actual_num_frames))
         if actual_num_frames < source_frames.shape[0]:
+            log.warning(
+                "[InfiniteTalk] Segment %s: wav2vec returned %s frames but %s source frames were loaded; truncating source frames to match.",
+                segment_label or "?",
+                actual_num_frames,
+                source_frames.shape[0],
+            )
             source_frames = source_frames[:actual_num_frames].contiguous()
         log.info(
             "[InfiniteTalk] Segment %s wav2vec ready actual_num_frames=%s",

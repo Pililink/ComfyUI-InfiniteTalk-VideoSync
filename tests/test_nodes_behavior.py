@@ -470,6 +470,44 @@ class NodeBehaviorTests(unittest.TestCase):
         self.assertIn("831", msg)
         self.assertIn("25", msg)
 
+    def test_auto_normalize_fps_default_is_enabled(self):
+        nodes = import_under_test("nodes")
+        optional = nodes.InfiniteTalkVideoPathNode.INPUT_TYPES()["optional"]
+
+        self.assertIn("auto_normalize_fps", optional)
+        self.assertTrue(optional["auto_normalize_fps"][1]["default"])
+
+    def test_normalize_source_video_to_cfr_command_uses_constant_rate(self):
+        nodes = import_under_test("nodes")
+        captured = {}
+
+        def fake_run(command, error_message, text=False):
+            captured["command"] = list(command)
+            return b""
+
+        original_run = nodes._run_command
+        original_ffmpeg = nodes.get_ffmpeg_path
+        nodes._run_command = fake_run
+        nodes.get_ffmpeg_path = lambda: "ffmpeg"
+        try:
+            nodes.normalize_source_video_to_cfr(
+                "src.mp4",
+                "dst.mp4",
+                target_fps=25.0,
+                video_codec="libx264",
+                video_crf=18,
+            )
+        finally:
+            nodes._run_command = original_run
+            nodes.get_ffmpeg_path = original_ffmpeg
+
+        joined = " ".join(captured["command"])
+        # Strict CFR re-encode: -r at the requested fps, vsync cfr, audio off.
+        self.assertIn("-r 25.0", joined)
+        self.assertIn("-vsync cfr", joined)
+        self.assertIn("-an", joined)
+        self.assertEqual("dst.mp4", captured["command"][-1])
+
     def test_no_duplicate_node_registration(self):
         """ComfyUI lists each NODE_CLASS_MAPPINGS key in the search palette;
         registering the same class under two keys (with the same display name)

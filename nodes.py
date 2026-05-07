@@ -688,6 +688,43 @@ def extract_audio_to_wav(media_path, target_audio_path):
     return target_audio_path
 
 
+def normalize_source_video_to_cfr(src_path, dst_path, target_fps, video_codec="libx264", video_crf=18):
+    """Re-encode `src_path` to a CFR file at exactly `target_fps`.
+
+    InfiniteTalk needs every output frame to have a real source frame to
+    follow. Many web/mobile videos report `r_frame_rate=25` but are actually
+    VFR or use 24.97x average fps; once `fps=25` is applied at decode time
+    they end up shorter than `duration * 25`. Running them through this
+    normalize step (`-r target_fps -vsync cfr`) duplicates/drops frames as
+    needed so the produced file's frame count is exactly
+    `round(duration * target_fps)`.
+    """
+    ffmpeg = get_ffmpeg_path()
+    encode_args = get_ffmpeg_video_encode_args(video_codec, video_crf)
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        src_path,
+        "-r",
+        str(float(target_fps)),
+        "-vsync",
+        "cfr",
+        "-an",
+    ]
+    command.extend(encode_args)
+    command.extend(["-movflags", "+faststart", dst_path])
+    _run_command(
+        command,
+        f"Failed to normalize {src_path} to CFR {target_fps}fps",
+        text=False,
+    )
+    return dst_path
+
+
 def _find_audio_separation_root():
     for custom_nodes_dir in _candidate_custom_nodes_dirs():
         candidate = custom_nodes_dir / "audio-separation-nodes-comfyui"
@@ -888,8 +925,9 @@ def _stream_encode_full_source_latent(
         raise RuntimeError(
             f"Source video produced only {delivered} frames at {target_fps}fps "
             f"but {total_frames} are required to match the audio. "
-            "The source likely has a variable or mis-tagged frame rate; "
-            f"re-encode it to constant {target_fps}fps before running the node."
+            "Enable auto_normalize_fps (default ON) to let the node re-encode "
+            "the source to constant frame rate, or re-encode it manually with "
+            f"`ffmpeg -i in.mp4 -r {target_fps} -vsync cfr out.mp4`."
         )
 
     full_latent = torch.cat(chunks, dim=2) if chunks[0].dim() == 5 else torch.cat(chunks, dim=1)
@@ -1343,6 +1381,13 @@ class InfiniteTalkVideoPathNode:
                 "target_width": ("STRING", {"default": "0"}),
                 "target_height": ("STRING", {"default": "0"}),
                 "separate_vocals": ("BOOLEAN", {"default": True}),
+                "auto_normalize_fps": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Re-encode the source video to constant target_fps before sampling. Recommended ON: many phone/web videos report r_frame_rate=25 but are actually VFR, which would otherwise produce fewer decoded frames than the audio needs.",
+                    },
+                ),
                 "keep_intermediates": ("BOOLEAN", {"default": False}),
                 "positive_prompt": ("STRING", {"default": DEFAULT_POSITIVE_PROMPT, "multiline": True}),
                 "negative_prompt": ("STRING", {"default": DEFAULT_NEGATIVE_PROMPT, "multiline": True}),
@@ -1417,6 +1462,7 @@ class InfiniteTalkVideoPathNode:
         target_width="0",
         target_height="0",
         separate_vocals=True,
+        auto_normalize_fps=True,
         keep_intermediates=False,
         positive_prompt=DEFAULT_POSITIVE_PROMPT,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
@@ -1656,6 +1702,43 @@ class InfiniteTalkVideoPathNode:
 
             output_duration = float(audio_duration)
             total_frames = max(1, int(round(output_duration * float(target_fps))))
+
+            # Re-encode the source to constant target_fps so the decoded frame
+            # count matches `total_frames` exactly. This is a no-op for true
+            # CFR sources (still costs a transcode pass, but avoids surprises
+            # when phone/web videos lie about r_frame_rate).
+            if bool(auto_normalize_fps):
+                normalized_path = os.path.join(work_dir, "normalized_source.mp4")
+                with _timed_log(
+                    "Normalize source to CFR",
+                    src=resolved_video_path,
+                    dst=normalized_path,
+                    target_fps=float(target_fps),
+                ):
+                    normalize_source_video_to_cfr(
+                        resolved_video_path,
+                        normalized_path,
+                        target_fps=float(target_fps),
+                        video_codec=video_codec,
+                        video_crf=18,
+                    )
+                resolved_video_path = normalized_path
+                normalized_info = get_video_info(resolved_video_path)
+                normalized_nb_frames = int(normalized_info.get("nb_frames") or 0)
+                log.info(
+                    "[InfiniteTalk] Normalized video: %.3fs, nb_frames=%s (target_fps=%s, total_frames=%s)",
+                    normalized_info["duration"],
+                    normalized_nb_frames,
+                    float(target_fps),
+                    total_frames,
+                )
+                if normalized_nb_frames and normalized_nb_frames < total_frames:
+                    raise RuntimeError(
+                        f"Normalized video has {normalized_nb_frames} frames at "
+                        f"{target_fps}fps but {total_frames} are required. "
+                        "The original video duration is too short for the audio "
+                        "after rounding; trim the audio or extend the video."
+                    )
             # `segment_seconds` is now only used to size the streaming source
             # latent encode chunks. We keep the historical name so existing
             # workflows do not break.

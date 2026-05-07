@@ -215,16 +215,21 @@ def multitalk_loop(self, **kwargs):
 
         if samples is not None:
             noise_mask = samples.get("noise_mask", None)
-            input_samples = samples["samples"]
-            if input_samples is not None:
-                input_samples = input_samples.squeeze(0).to(noise)
-                # Check if we have enough frames in input_samples
-                if latent_end_idx > input_samples.shape[1]:
-                    # We need more frames than available - pad the input_samples at the end
-                    pad_length = latent_end_idx - input_samples.shape[1]
-                    last_frame = input_samples[:, -1:].repeat(1, pad_length, 1, 1)
-                    input_samples = torch.cat([input_samples, last_frame], dim=1)
-                input_samples = input_samples[:, latent_start_idx:latent_end_idx]
+            input_samples_full = samples["samples"]
+            if input_samples_full is not None:
+                # Keep the full latent on whatever device it arrived on
+                # (CPU when streamed in chunks for long videos) and only
+                # move the active window's slice to the GPU each iteration.
+                # The previous behaviour materialized the entire latent on
+                # GPU once per iteration, which made long-video streaming
+                # impossible.
+                input_samples_cpu = input_samples_full.squeeze(0)
+                # Pad in CPU space so we still cover every requested frame.
+                if latent_end_idx > input_samples_cpu.shape[1]:
+                    pad_length = latent_end_idx - input_samples_cpu.shape[1]
+                    last_frame = input_samples_cpu[:, -1:].repeat(1, pad_length, 1, 1)
+                    input_samples_cpu = torch.cat([input_samples_cpu, last_frame], dim=1)
+                input_samples = input_samples_cpu[:, latent_start_idx:latent_end_idx].to(noise)
                 if noise_mask is not None:
                     original_image = input_samples.to(device)
 

@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import threading
@@ -20,19 +21,37 @@ from .infinitetalk_runtime import (
     InfiniteTalkEngine,
     _candidate_custom_nodes_dirs,
     _ensure_namespace_package,
+    slice_multitalk_embeds,
 )
 
 log = logging.getLogger("InfiniteTalkVideoSync")
 
 _AUDIO_SEPARATION_NAMESPACE = "_infinitetalk_audio_separation"
 
+DEFAULT_POSITIVE_PROMPT = ""
+
 DEFAULT_NEGATIVE_PROMPT = (
-    "bright tones, overexposed, static, blurred details, subtitles, style, works, "
-    "paintings, images, static, overall gray, worst quality, low quality, JPEG "
-    "compression residue, ugly, incomplete, extra fingers, poorly drawn hands, "
-    "poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, "
-    "still picture, messy background, walking backwards"
+    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
+    "最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
+    "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
+    "杂乱的背景，三条腿，背景人很多，倒着走"
 )
+
+RESIZE_MODES = ("crop_to_size", "fit_inside")
+RESIZE_FILTERS = ("nearest-exact", "lanczos", "bicubic", "bilinear", "area")
+VIDEO_CODECS = ("libx264", "h264_nvenc", "h264_qsv", "h264_amf", "auto")
+REFERENCE_WORKFLOW_MODEL_HINTS = {
+    "lora_model": ("lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16",),
+    "vae_model": ("Wan2_1_VAE_bf16",),
+    "text_encoder_model": ("umt5-xxl-enc-bf16",),
+}
+FFMPEG_SCALE_FLAGS = {
+    "nearest-exact": "neighbor",
+    "lanczos": "lanczos",
+    "bicubic": "bicubic",
+    "bilinear": "bilinear",
+    "area": "area",
+}
 
 
 def _format_log_fields(**fields):
@@ -145,6 +164,10 @@ def normalize_frame_window_size(value):
     return ((value - 1) // 4) * 4 + 1
 
 
+def _should_cleanup_work_dir(keep_intermediates):
+    return not bool(keep_intermediates)
+
+
 def _safe_fps_value(fps_str):
     if not fps_str:
         return 25.0
@@ -224,6 +247,81 @@ def _resolve_auto_target_size(source_width, source_height, max_width=832, max_he
     target_width = _align_down_to_multiple(source_width * scale, 16)
     target_height = _align_down_to_multiple(source_height * scale, 16)
     return target_width, target_height
+
+
+def _normalize_resize_mode(resize_mode):
+    resize_mode = str(resize_mode or "crop_to_size").strip()
+    if resize_mode in RESIZE_MODES:
+        return resize_mode
+    log.warning(
+        "[InfiniteTalk] Unknown resize_mode=%r, fallback to crop_to_size",
+        resize_mode,
+    )
+    return "crop_to_size"
+
+
+def _normalize_resize_filter(resize_filter):
+    resize_filter = str(resize_filter or "nearest-exact").strip()
+    if resize_filter in RESIZE_FILTERS:
+        return resize_filter
+    log.warning(
+        "[InfiniteTalk] Unknown resize_filter=%r, fallback to nearest-exact",
+        resize_filter,
+    )
+    return "nearest-exact"
+
+
+def _normalize_video_codec(video_codec):
+    video_codec = str(video_codec or "libx264").strip()
+    if video_codec in VIDEO_CODECS:
+        return video_codec
+    log.warning(
+        "[InfiniteTalk] Unknown video_codec=%r, fallback to libx264",
+        video_codec,
+    )
+    return "libx264"
+
+
+def resolve_target_size(source_width, source_height, max_width=480, max_height=832, resize_mode="crop_to_size"):
+    resize_mode = _normalize_resize_mode(resize_mode)
+    if resize_mode == "fit_inside":
+        return _resolve_auto_target_size(
+            source_width,
+            source_height,
+            max_width=max_width,
+            max_height=max_height,
+        )
+
+    source_width = int(source_width)
+    source_height = int(source_height)
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError(f"Invalid source size: {source_width}x{source_height}")
+
+    target_width = _align_down_to_multiple(max_width, 16)
+    target_height = _align_down_to_multiple(max_height, 16)
+    return target_width, target_height
+
+
+def build_video_filter(
+    target_width,
+    target_height,
+    target_fps,
+    resize_mode="crop_to_size",
+    resize_filter="nearest-exact",
+):
+    resize_mode = _normalize_resize_mode(resize_mode)
+    resize_filter = _normalize_resize_filter(resize_filter)
+    scale_flags = FFMPEG_SCALE_FLAGS[resize_filter]
+    target_width = int(target_width)
+    target_height = int(target_height)
+    fps_filter = f"fps={target_fps}"
+    if resize_mode == "fit_inside":
+        return f"{fps_filter},scale={target_width}:{target_height}:flags={scale_flags}"
+    return (
+        f"{fps_filter},"
+        f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase:flags={scale_flags},"
+        f"crop={target_width}:{target_height}"
+    )
 
 
 def _coerce_int_value(
@@ -316,29 +414,93 @@ def _coerce_float_value(value, field_name, default, min_value=None, max_value=No
     return parsed
 
 
-def load_video_chunk(video_path, start_frame, num_frames, target_width, target_height, target_fps):
+def load_video_chunk(
+    video_path,
+    start_frame,
+    num_frames,
+    target_width,
+    target_height,
+    target_fps,
+    resize_mode="crop_to_size",
+    resize_filter="lanczos",
+):
+    """Decode an exact frame range from `video_path`.
+
+    Frames are addressed in the resampled `target_fps` timeline so the indices
+    line up 1:1 with the global wav2vec embeddings used by InfiniteTalk. We
+    apply the fps + scale filter first and then `select`/`trim` by frame
+    number, which guarantees the first decoded frame is exactly
+    `start_frame` in the resampled timeline regardless of the source GOP
+    structure (input `-ss` would jump to the nearest keyframe and silently
+    drift the audio/video alignment).
+    """
     ffmpeg = get_ffmpeg_path()
-    start_time = max(0.0, float(start_frame) / float(target_fps))
+    start_frame = max(0, int(start_frame))
+    num_frames = max(1, int(num_frames))
+    end_frame = start_frame + num_frames
+    base_filter = build_video_filter(target_width, target_height, target_fps, resize_mode, resize_filter)
+    select_filter = (
+        f"select='between(n,{start_frame},{end_frame - 1})',setpts=PTS-STARTPTS"
+    )
+    video_filter = f"{base_filter},{select_filter}"
+
+    # Coarse `-ss` *before* `-i` is OK because we still re-select by frame
+    # number after the fps filter; it just trims the keyframe seek window
+    # for performance. Land 2 seconds before our target to leave room for
+    # GOP boundaries.
+    seek_buffer_seconds = 2.0
+    coarse_seek = max(0.0, float(start_frame) / float(target_fps) - seek_buffer_seconds)
     command = [
         ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
-        "-ss",
-        f"{start_time:.6f}",
-        "-i",
-        video_path,
-        "-vf",
-        f"fps={target_fps},scale={target_width}:{target_height}:flags=lanczos",
-        "-frames:v",
-        str(int(num_frames)),
-        "-pix_fmt",
-        "rgb24",
-        "-f",
-        "rawvideo",
-        "pipe:1",
     ]
+    if coarse_seek > 0.0:
+        command.extend(["-ss", f"{coarse_seek:.6f}"])
+    command.extend(
+        [
+            "-i",
+            video_path,
+            "-vf",
+            video_filter,
+            "-vsync",
+            "cfr",
+            "-frames:v",
+            str(num_frames),
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]
+    )
     raw = _run_command(command, f"Failed to load video frames from {video_path}", text=False)
+    if not raw and coarse_seek > 0.0:
+        log.warning(
+            "[InfiniteTalk] Empty decode with coarse seek=%.3f, retrying without pre-seek",
+            coarse_seek,
+        )
+        retry_command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_path,
+            "-vf",
+            video_filter,
+            "-vsync",
+            "cfr",
+            "-frames:v",
+            str(num_frames),
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]
+        raw = _run_command(retry_command, f"Failed to load video frames from {video_path}", text=False)
     if not raw:
         raise RuntimeError(f"ffmpeg returned no frames for {video_path} @ frame {start_frame}")
 
@@ -499,15 +661,18 @@ def get_preferred_ffmpeg_video_codec():
     return "libx264"
 
 
-def get_ffmpeg_video_encode_args(codec=None):
-    codec = codec or get_preferred_ffmpeg_video_codec()
+def get_ffmpeg_video_encode_args(codec="libx264", crf=19):
+    codec = _normalize_video_codec(codec)
+    if codec == "auto":
+        codec = get_preferred_ffmpeg_video_codec()
+    crf = max(0, min(51, int(crf)))
     if codec == "h264_nvenc":
-        return ["-c:v", codec, "-preset", "p4", "-cq", "19", "-pix_fmt", "yuv420p"]
+        return ["-c:v", codec, "-preset", "p5", "-rc", "vbr", "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
     if codec == "h264_qsv":
-        return ["-c:v", codec, "-global_quality", "21", "-pix_fmt", "yuv420p"]
+        return ["-c:v", codec, "-global_quality", str(crf), "-pix_fmt", "yuv420p"]
     if codec == "h264_amf":
-        return ["-c:v", codec, "-quality", "balanced", "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p"]
+        return ["-c:v", codec, "-quality", "quality", "-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf), "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p"]
 
 
 def _resolve_frame_sequence_dir(frames_dir):
@@ -539,7 +704,15 @@ def _resolve_frame_sequence_dir(frames_dir):
     return frames_dir
 
 
-def encode_png_sequence_to_video(frames_dir, output_path, fps, start_number=0, frame_count=None):
+def encode_png_sequence_to_video(
+    frames_dir,
+    output_path,
+    fps,
+    start_number=0,
+    frame_count=None,
+    video_codec="libx264",
+    video_crf=19,
+):
     frames_dir = _resolve_frame_sequence_dir(frames_dir)
     pattern = os.path.join(frames_dir, "frame_%05d.png")
     ffmpeg = get_ffmpeg_path()
@@ -558,12 +731,143 @@ def encode_png_sequence_to_video(frames_dir, output_path, fps, start_number=0, f
     ]
     if frame_count is not None:
         command.extend(["-frames:v", str(int(frame_count))])
-    command.extend(get_ffmpeg_video_encode_args())
+    command.extend(get_ffmpeg_video_encode_args(video_codec, video_crf))
     command.extend(["-movflags", "+faststart", output_path])
     _run_command(command, f"Failed to encode png sequence from {frames_dir}", text=False)
 
 
-def concat_segments_with_audio(segment_paths, audio_path, output_path, duration):
+def _stream_encode_full_source_latent(
+    engine,
+    video_path,
+    total_frames,
+    target_width,
+    target_height,
+    target_fps,
+    resize_mode,
+    resize_filter,
+    chunk_frames,
+):
+    """Decode + VAE-encode the source video in chunks and return a CPU latent
+    that covers `total_frames` frames at `target_fps`.
+
+    InfiniteTalk's multitalk_loop slices `samples["samples"]` along the time
+    axis per inner window, so the latent must span the entire output length.
+    Encoding chunk by chunk keeps the GPU pixel buffer bounded while the
+    latent (which is ~150x smaller per byte) accumulates on CPU.
+    """
+    chunk_frames = max(1, int(chunk_frames))
+    chunk_frames = ((chunk_frames - 1) // 4) * 4 + 1  # latent stride is 4
+    chunks = []
+    first_frame_pixels = None
+    last_frame_pixels = None
+    next_start = 0
+    chunk_index = 0
+    while next_start < total_frames:
+        _throw_if_interrupted()
+        remaining = total_frames - next_start
+        this_chunk = min(chunk_frames, remaining)
+        if this_chunk > 1 and remaining > chunk_frames:
+            this_chunk = chunk_frames
+
+        with _timed_log(
+            "Source video chunk",
+            chunk=f"{chunk_index + 1}",
+            start_frame=next_start,
+            frames=this_chunk,
+            width=int(target_width),
+            height=int(target_height),
+            fps=float(target_fps),
+            resize_mode=resize_mode,
+            resize_filter=resize_filter,
+        ):
+            source_chunk = load_video_chunk(
+                video_path,
+                next_start,
+                this_chunk,
+                int(target_width),
+                int(target_height),
+                float(target_fps),
+                resize_mode=resize_mode,
+                resize_filter=resize_filter,
+            )
+
+        if first_frame_pixels is None:
+            first_frame_pixels = source_chunk[0:1].clone()
+        last_frame_pixels = source_chunk[-1:].clone()
+
+        latent_chunk = engine.encode_source_latent(
+            source_chunk,
+            label=f"chunk_{chunk_index + 1}",
+        )
+        chunks.append(latent_chunk)
+        next_start += int(source_chunk.shape[0])
+        chunk_index += 1
+        del source_chunk
+
+    if not chunks:
+        raise RuntimeError("Source video produced no frames")
+
+    full_latent = torch.cat(chunks, dim=2) if chunks[0].dim() == 5 else torch.cat(chunks, dim=1)
+    expected_latent_t = (total_frames - 1) // 4 + 1
+    actual_latent_t = full_latent.shape[2] if full_latent.dim() == 5 else full_latent.shape[1]
+    if actual_latent_t > expected_latent_t:
+        if full_latent.dim() == 5:
+            full_latent = full_latent[:, :, :expected_latent_t].contiguous()
+        else:
+            full_latent = full_latent[:, :expected_latent_t].contiguous()
+    return full_latent, first_frame_pixels, last_frame_pixels
+
+
+def _encode_full_video_with_audio(
+    frames_dir,
+    audio_path,
+    output_path,
+    target_fps,
+    duration,
+    video_codec="libx264",
+    video_crf=19,
+):
+    """Encode the rendered PNG sequence into a single mp4 with the audio
+    track muxed in, in one ffmpeg invocation. Faster and more accurate than
+    the old per-segment encode + concat-copy pipeline.
+    """
+    frames_dir = _resolve_frame_sequence_dir(frames_dir)
+    pattern = os.path.join(frames_dir, "frame_%05d.png")
+    ffmpeg = get_ffmpeg_path()
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-framerate",
+        str(float(target_fps)),
+        "-start_number",
+        "0",
+        "-i",
+        pattern,
+        "-i",
+        audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-t",
+        f"{float(duration):.6f}",
+    ]
+    command.extend(get_ffmpeg_video_encode_args(video_codec, video_crf))
+    command.extend(["-c:a", "aac", "-movflags", "+faststart", output_path])
+    _run_command(command, f"Failed to encode final InfiniteTalk video to {output_path}", text=False)
+
+
+def concat_segments_with_audio(
+    segment_paths,
+    audio_path,
+    output_path,
+    duration,
+    video_codec="libx264",
+    video_crf=19,
+):
     ffmpeg = get_ffmpeg_path()
     list_path = f"{output_path}.segments.txt"
     with open(list_path, "w", encoding="utf-8") as handle:
@@ -624,7 +928,7 @@ def concat_segments_with_audio(segment_paths, audio_path, output_path, duration)
             "-t",
             f"{float(duration):.6f}",
         ]
-        reencode_command.extend(get_ffmpeg_video_encode_args())
+        reencode_command.extend(get_ffmpeg_video_encode_args(video_codec, video_crf))
         reencode_command.extend(["-c:a", "aac", "-movflags", "+faststart", output_path])
         _run_command(reencode_command, "Failed to mux InfiniteTalk output", text=False)
     finally:
@@ -650,6 +954,55 @@ def build_output_file_ui_entry(file_path, media_format="video/mp4"):
     }
 
 
+def _strip_counter_suffix(filename_prefix):
+    return re.sub(r"_(\d{5,})$", "", str(filename_prefix or "").strip())
+
+
+def _next_output_counter(output_folder, filename_prefix):
+    filename_prefix = str(filename_prefix or "InfiniteTalk")
+    pattern = re.compile(rf"^{re.escape(filename_prefix)}_(\d+)(?:[_.]|$)", re.IGNORECASE)
+    max_counter = 0
+    try:
+        entries = os.scandir(output_folder)
+    except FileNotFoundError:
+        return 1
+
+    with entries:
+        for entry in entries:
+            match = pattern.match(entry.name)
+            if not match:
+                continue
+            try:
+                max_counter = max(max_counter, int(match.group(1)))
+            except ValueError:
+                continue
+    return max_counter + 1
+
+
+def _numbered_mp4_path(output_folder, filename_prefix):
+    filename_prefix = _strip_counter_suffix(filename_prefix) or "InfiniteTalk"
+    os.makedirs(output_folder, exist_ok=True)
+    counter = _next_output_counter(output_folder, filename_prefix)
+    output_filename = f"{filename_prefix}_{counter:05d}.mp4"
+    return os.path.join(output_folder, output_filename), output_filename
+
+
+def _comfy_save_folder_and_prefix(filename_prefix, output_root):
+    try:
+        full_output_folder, filename, _counter, _, _ = folder_paths.get_save_image_path(
+            filename_prefix,
+            output_root,
+        )
+    except TypeError:
+        full_output_folder, filename, _counter, _, _ = folder_paths.get_save_image_path(
+            filename_prefix,
+            output_root,
+            0,
+            0,
+        )
+    return full_output_folder, _strip_counter_suffix(filename)
+
+
 def get_output_video_path(filename_prefix, output_path=""):
     output_root = os.path.abspath(folder_paths.get_output_directory())
     output_path = str(output_path or "").strip().strip('"').strip("'")
@@ -665,37 +1018,10 @@ def get_output_video_path(filename_prefix, output_path=""):
         else:
             target_dir = os.path.dirname(expanded) or output_root
             target_prefix = os.path.splitext(os.path.basename(expanded))[0] or filename_prefix
-        try:
-            full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(
-                target_prefix,
-                target_dir,
-            )
-        except TypeError:
-            full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(
-                target_prefix,
-                target_dir,
-                0,
-                0,
-            )
-        os.makedirs(full_output_folder, exist_ok=True)
-        output_filename = f"{filename}_{counter:05d}.mp4"
-        return os.path.join(full_output_folder, output_filename), output_filename
+        return _numbered_mp4_path(target_dir, target_prefix)
 
-    try:
-        full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(
-            filename_prefix,
-            output_root,
-        )
-    except TypeError:
-        full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(
-            filename_prefix,
-            output_root,
-            0,
-            0,
-        )
-    os.makedirs(full_output_folder, exist_ok=True)
-    output_filename = f"{filename}_{counter:05d}.mp4"
-    return os.path.join(full_output_folder, output_filename), output_filename
+    full_output_folder, filename = _comfy_save_folder_and_prefix(filename_prefix, output_root)
+    return _numbered_mp4_path(full_output_folder, filename)
 
 
 def _folder_choices(category, preferred_substrings, allow_none=False):
@@ -724,6 +1050,21 @@ def _folder_choices(category, preferred_substrings, allow_none=False):
     return values, default
 
 
+def _warn_reference_model_mismatch(field_name, value):
+    hints = REFERENCE_WORKFLOW_MODEL_HINTS.get(field_name)
+    if not hints:
+        return
+    lowered = str(value or "").lower()
+    if any(hint.lower() in lowered for hint in hints):
+        return
+    log.warning(
+        "[InfiniteTalk] %s=%s differs from the reference workflow preferred model (%s); output quality may differ",
+        field_name,
+        value or "<empty>",
+        " or ".join(hints),
+    )
+
+
 class InfiniteTalkVideoPathNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -737,7 +1078,13 @@ class InfiniteTalkVideoPathNode:
         )
         loras, lora_default = _folder_choices(
             "loras",
-            ("lightx2v_I2V_14B_480p_cfg_step_distill_rank128", "lightx2v"),
+            (
+                "lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16",
+                "lightx2v_I2V_14B_480p_cfg_step_distill_rank128",
+                "lightx2v_I2V_14B_480p_cfg_step_distill_rank64",
+                "Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64",
+                "lightx2v",
+            ),
             allow_none=True,
         )
         vaes, vae_default = _folder_choices(
@@ -746,7 +1093,7 @@ class InfiniteTalkVideoPathNode:
         )
         text_encoders, text_default = _folder_choices(
             "text_encoders",
-            ("umt5-xxl-enc-bf16", "umt5"),
+            ("umt5-xxl-enc-bf16", "umt5-xxl-enc-fp8_e4m3fn", "umt5"),
         )
         clip_models, clip_default = _folder_choices(
             "clip_vision",
@@ -763,6 +1110,16 @@ class InfiniteTalkVideoPathNode:
                         "placeholder": "D:/videos/input.mp4",
                     },
                 ),
+                "audio_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "placeholder": "D:/audio/input.wav",
+                    },
+                ),
+            },
+            "optional": {
                 "wan_model": (wan_models, {"default": wan_default}),
                 "infinitetalk_model": (multitalk_models, {"default": multitalk_default}),
                 "lora_model": (loras, {"default": lora_default}),
@@ -776,21 +1133,38 @@ class InfiniteTalkVideoPathNode:
                     ],
                     {"default": "TencentGameMate/chinese-wav2vec2-base"},
                 ),
-                "target_fps": (
-                    "FLOAT",
-                    {
-                        "default": 25.0,
-                        "min": 1.0,
-                        "max": 1000.0,
-                        "step": 0.1,
-                    },
+                "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "fp16"}),
+                "quantization": (
+                    ["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e4m3fn_scaled"],
+                    {"default": "fp8_e4m3fn_scaled"},
                 ),
+                "attention_mode": (
+                    [
+                        "sageattn",
+                        "comfy",
+                        "sdpa",
+                        "flash_attn_2",
+                        "flash_attn_3",
+                        "sageattn_3",
+                        "sageattn_compiled",
+                    ],
+                    {"default": "sageattn"},
+                ),
+                "vae_precision": (["fp32", "bf16", "fp16"], {"default": "bf16"}),
+                "text_precision": (["fp32", "bf16"], {"default": "bf16"}),
+                "text_quantization": (
+                    ["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast"],
+                    {"default": "disabled"},
+                ),
+                "wav2vec_precision": (["fp32", "bf16", "fp16"], {"default": "fp16"}),
+                "wav2vec_load_device": (["main_device", "offload_device"], {"default": "main_device"}),
+                "target_fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 60.0, "step": 0.1}),
                 "segment_seconds": (
                     "FLOAT",
                     {
                         "default": 20.0,
                         "min": 4.0,
-                        "max": 3600.0,
+                        "max": 120.0,
                         "step": 1.0,
                         "tooltip": "Outer segment length. Larger values reduce splice count but use more RAM.",
                     },
@@ -800,7 +1174,7 @@ class InfiniteTalkVideoPathNode:
                     {
                         "default": 81,
                         "min": 5,
-                        "max": 1024,
+                        "max": 241,
                         "step": 4,
                         "tooltip": "Internal InfiniteTalk window size. Must be 4n+1.",
                     },
@@ -810,43 +1184,88 @@ class InfiniteTalkVideoPathNode:
                     {
                         "default": 9,
                         "min": 1,
-                        "max": 256,
+                        "max": 80,
                         "step": 1,
                         "tooltip": "Overlap frames for both internal windows and outer segments.",
                     },
                 ),
-                "steps": ("INT", {"default": 5, "min": 1, "max": 1024, "step": 1}),
+                "steps": ("INT", {"default": 5, "min": 1, "max": 30, "step": 1}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
-                "seed": ("INT", {"default": 42}),
-                "block_swap": ("INT", {"default": 30, "min": 0, "max": 1024, "step": 1}),
-                "filename_prefix": ("STRING", {"default": "InfiniteTalk"}),
-                "audio_path": (
-                    "STRING",
+                "shift": ("FLOAT", {"default": 11.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "scheduler": (
+                    ["dpm++_sde", "flowmatch_distill", "unipc", "euler", "euler_ancestral"],
+                    {"default": "dpm++_sde"},
+                ),
+                "seed": ("INT", {"default": 1, "min": 0, "max": 2**31 - 1}),
+                "start_step": ("INT", {"default": 3, "min": 0, "max": 20, "step": 1}),
+                "end_step": ("INT", {"default": -1, "min": -1, "max": 1000, "step": 1}),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "batched_cfg": ("BOOLEAN", {"default": False}),
+                "rope_function": (["default", "comfy", "comfy_chunked"], {"default": "comfy"}),
+                "add_noise_to_samples": ("BOOLEAN", {"default": True}),
+                "sampler_force_offload": ("BOOLEAN", {"default": True}),
+                "block_swap": ("INT", {"default": 20, "min": 0, "max": 40, "step": 1}),
+                "use_non_blocking": ("BOOLEAN", {"default": True}),
+                "prefetch_blocks": ("INT", {"default": 1, "min": 0, "max": 16, "step": 1}),
+                "lora_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
+                "audio_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "audio_cfg_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "normalize_loudness": ("BOOLEAN", {"default": True}),
+                "clip_strength_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
+                "clip_strength_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
+                "clip_use_last_frame": (
+                    "BOOLEAN",
                     {
-                        "default": "",
-                        "multiline": False,
-                        "placeholder": "Leave empty to use the source video's audio",
+                        "default": False,
+                        "tooltip": "Match the reference workflow by default: only image_1 is used for CLIP vision.",
                     },
                 ),
-            },
-            "optional": {
-                "audio": ("AUDIO",),
+                "encode_tiled_vae": ("BOOLEAN", {"default": False}),
+                "decode_tiled_vae": ("BOOLEAN", {"default": False}),
+                "tile_x": ("INT", {"default": 272, "min": 64, "max": 2048, "step": 16}),
+                "tile_y": ("INT", {"default": 272, "min": 64, "max": 2048, "step": 16}),
+                "tile_stride_x": ("INT", {"default": 144, "min": 32, "max": 2048, "step": 16}),
+                "tile_stride_y": ("INT", {"default": 128, "min": 32, "max": 2048, "step": 16}),
+                "filename_prefix": ("STRING", {"default": "InfiniteTalk"}),
                 "output_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Optional output file or directory"}),
-                "max_width": ("STRING", {"default": "832"}),
-                "max_height": ("STRING", {"default": "480"}),
-                "lora_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "start_step": ("INT", {"default": 3, "min": 0, "max": 20, "step": 1}),
-                "separate_vocals": ("BOOLEAN", {"default": False}),
-                "keep_intermediates": ("BOOLEAN", {"default": False}),
-                "positive_prompt": ("STRING", {"default": "", "multiline": True}),
-                "negative_prompt": ("STRING", {"default": DEFAULT_NEGATIVE_PROMPT, "multiline": True}),
+                "video_codec": (list(VIDEO_CODECS), {"default": "libx264"}),
+                "video_crf": (
+                    "INT",
+                    {
+                        "default": 19,
+                        "min": 0,
+                        "max": 51,
+                        "step": 1,
+                        "tooltip": "Lower is higher quality. Default matches the reference VideoCombine CRF.",
+                    },
+                ),
+                "resize_mode": (
+                    list(RESIZE_MODES),
+                    {
+                        "default": "crop_to_size",
+                        "tooltip": "crop_to_size matches the reference workflow. fit_inside keeps the whole frame with lower memory use.",
+                    },
+                ),
+                "resize_filter": (
+                    list(RESIZE_FILTERS),
+                    {
+                        "default": "lanczos",
+                        "tooltip": "lanczos matches the reference workflow ImageResizeKJv2 upscale_method.",
+                    },
+                ),
+                "max_width": ("STRING", {"default": "480"}),
+                "max_height": ("STRING", {"default": "832"}),
                 "target_width": ("STRING", {"default": "0"}),
                 "target_height": ("STRING", {"default": "0"}),
+                "separate_vocals": ("BOOLEAN", {"default": True}),
+                "keep_intermediates": ("BOOLEAN", {"default": False}),
+                "positive_prompt": ("STRING", {"default": DEFAULT_POSITIVE_PROMPT, "multiline": True}),
+                "negative_prompt": ("STRING", {"default": DEFAULT_NEGATIVE_PROMPT, "multiline": True}),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "AUDIO")
-    RETURN_NAMES = ("video_path", "filename", "audio")
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_path",)
     FUNCTION = "process"
     CATEGORY = "InfiniteTalk"
     OUTPUT_NODE = True
@@ -854,38 +1273,73 @@ class InfiniteTalkVideoPathNode:
     def process(
         self,
         video_path,
-        wan_model,
-        infinitetalk_model,
-        lora_model,
-        vae_model,
-        text_encoder_model,
-        clip_vision_model,
-        wav2vec_model,
-        target_fps,
-        segment_seconds,
-        frame_window_size,
-        motion_frame,
-        steps,
-        cfg,
-        seed,
-        block_swap,
-        filename_prefix,
         audio_path="",
-        audio=None,
-        output_path="",
-        max_width="832",
-        max_height="480",
-        lora_strength=1.0,
+        wan_model="",
+        infinitetalk_model="",
+        lora_model="none",
+        vae_model="",
+        text_encoder_model="",
+        clip_vision_model="",
+        wav2vec_model="TencentGameMate/chinese-wav2vec2-base",
+        base_precision="fp16",
+        quantization="fp8_e4m3fn_scaled",
+        attention_mode="sageattn",
+        vae_precision="bf16",
+        text_precision="bf16",
+        text_quantization="disabled",
+        wav2vec_precision="fp16",
+        wav2vec_load_device="main_device",
+        target_fps=25.0,
+        segment_seconds=20.0,
+        frame_window_size=81,
+        motion_frame=9,
+        steps=5,
+        cfg=1.0,
+        shift=11.0,
+        scheduler="dpm++_sde",
+        seed=1,
         start_step=3,
-        separate_vocals=False,
-        keep_intermediates=False,
-        positive_prompt="",
-        negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+        end_step=-1,
+        denoise_strength=1.0,
+        batched_cfg=False,
+        rope_function="comfy",
+        add_noise_to_samples=True,
+        sampler_force_offload=True,
+        block_swap=20,
+        use_non_blocking=True,
+        prefetch_blocks=1,
+        lora_strength=1.0,
+        audio_scale=1.0,
+        audio_cfg_scale=1.0,
+        normalize_loudness=True,
+        clip_strength_1=1.0,
+        clip_strength_2=1.0,
+        clip_use_last_frame=False,
+        encode_tiled_vae=False,
+        decode_tiled_vae=False,
+        tile_x=272,
+        tile_y=272,
+        tile_stride_x=144,
+        tile_stride_y=128,
+        filename_prefix="InfiniteTalk",
+        output_path="",
+        video_codec="libx264",
+        video_crf=19,
+        resize_mode="crop_to_size",
+        resize_filter="lanczos",
+        max_width="480",
+        max_height="832",
         target_width="0",
         target_height="0",
+        separate_vocals=True,
+        keep_intermediates=False,
+        positive_prompt=DEFAULT_POSITIVE_PROMPT,
+        negative_prompt=DEFAULT_NEGATIVE_PROMPT,
     ):
         legacy_target_width = target_width
         legacy_target_height = target_height
+        resize_mode = _normalize_resize_mode(resize_mode)
+        resize_filter = _normalize_resize_filter(resize_filter)
 
         target_fps = _coerce_float_value(target_fps, "target_fps", 25.0, min_value=1.0, max_value=60.0)
         segment_seconds = _coerce_float_value(
@@ -911,6 +1365,7 @@ class InfiniteTalkVideoPathNode:
         )
         steps = _coerce_int_value(steps, "steps", 5, min_value=1, max_value=30)
         cfg = _coerce_float_value(cfg, "cfg", 1.0, min_value=0.0, max_value=10.0)
+        shift = _coerce_float_value(shift, "shift", 11.0, min_value=0.0, max_value=100.0)
         lora_strength = _coerce_float_value(
             lora_strength,
             "lora_strength",
@@ -919,8 +1374,28 @@ class InfiniteTalkVideoPathNode:
             max_value=4.0,
         )
         start_step = _coerce_int_value(start_step, "start_step", 3, min_value=0, max_value=20)
-        seed = _coerce_int_value(seed, "seed", 42, min_value=0, max_value=2**31 - 1, allow_randomize=True)
-        block_swap = _coerce_int_value(block_swap, "block_swap", 30, min_value=0, max_value=40)
+        end_step = _coerce_int_value(end_step, "end_step", -1, min_value=-1, max_value=1000)
+        denoise_strength = _coerce_float_value(
+            denoise_strength,
+            "denoise_strength",
+            1.0,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        seed = _coerce_int_value(seed, "seed", 1, min_value=0, max_value=2**31 - 1, allow_randomize=True)
+        block_swap = _coerce_int_value(block_swap, "block_swap", 20, min_value=0, max_value=40)
+        prefetch_blocks = _coerce_int_value(prefetch_blocks, "prefetch_blocks", 1, min_value=0, max_value=16)
+        tile_x = _coerce_int_value(tile_x, "tile_x", 272, min_value=64, max_value=2048)
+        tile_y = _coerce_int_value(tile_y, "tile_y", 272, min_value=64, max_value=2048)
+        tile_stride_x = _coerce_int_value(tile_stride_x, "tile_stride_x", 144, min_value=32, max_value=2048)
+        tile_stride_y = _coerce_int_value(tile_stride_y, "tile_stride_y", 128, min_value=32, max_value=2048)
+        audio_scale = _coerce_float_value(audio_scale, "audio_scale", 1.0, min_value=0.0, max_value=10.0)
+        audio_cfg_scale = _coerce_float_value(audio_cfg_scale, "audio_cfg_scale", 1.0, min_value=0.0, max_value=10.0)
+        clip_strength_1 = _coerce_float_value(clip_strength_1, "clip_strength_1", 1.0, min_value=0.0, max_value=4.0)
+        clip_strength_2 = _coerce_float_value(clip_strength_2, "clip_strength_2", 1.0, min_value=0.0, max_value=4.0)
+        video_codec = _normalize_video_codec(video_codec)
+        video_crf = _coerce_int_value(video_crf, "video_crf", 19, min_value=0, max_value=51)
+        clip_use_last_frame = bool(clip_use_last_frame)
         audio_path = str(audio_path or "").strip()
         filename_prefix = str(filename_prefix or "InfiniteTalk").strip()
         if filename_prefix.lower() == "randomize" or filename_prefix.isdigit():
@@ -929,24 +1404,23 @@ class InfiniteTalkVideoPathNode:
                 filename_prefix,
             )
             filename_prefix = "InfiniteTalk"
-        if not audio_path:
-            audio_path = ""
-        elif audio_path.lower() == "randomize" or audio_path.isdigit():
+        if audio_path.lower() == "randomize" or audio_path.isdigit():
             log.warning(
-                "[InfiniteTalk] Suspicious audio_path=%r, fallback to source video audio",
+                "[InfiniteTalk] Suspicious audio_path=%r, rejecting input",
                 audio_path,
             )
             audio_path = ""
         output_path = str(output_path or "")
 
         resolved_video_path = resolve_user_path(video_path, "video_path")
+        resolved_audio_path = resolve_user_path(audio_path, "audio_path")
         frame_window_size = normalize_frame_window_size(frame_window_size)
         motion_frame = int(motion_frame)
 
         if motion_frame >= frame_window_size:
             raise ValueError("motion_frame must be smaller than frame_window_size")
 
-        final_output_path, output_filename = get_output_video_path(filename_prefix, output_path)
+        final_output_path, _output_filename = get_output_video_path(filename_prefix, output_path)
         final_output_path = os.path.abspath(final_output_path)
         work_dir = os.path.join(
             os.path.dirname(final_output_path),
@@ -966,8 +1440,8 @@ class InfiniteTalkVideoPathNode:
                 video_info["fps"],
                 video_info["duration"],
             )
-            max_width = _coerce_int_value(max_width, "max_width", 832, min_value=16, max_value=4096)
-            max_height = _coerce_int_value(max_height, "max_height", 480, min_value=16, max_value=4096)
+            max_width = _coerce_int_value(max_width, "max_width", 480, min_value=16, max_value=4096)
+            max_height = _coerce_int_value(max_height, "max_height", 832, min_value=16, max_value=4096)
             target_width = _coerce_int_value(
                 legacy_target_width,
                 "target_width",
@@ -988,40 +1462,81 @@ class InfiniteTalkVideoPathNode:
             if target_height > 0:
                 log.info("[InfiniteTalk] Using legacy target_height=%s for auto resolution clamp", target_height)
                 max_height = target_height
-            target_width, target_height = _resolve_auto_target_size(
+            target_width, target_height = resolve_target_size(
                 video_info["width"],
                 video_info["height"],
                 max_width=max_width,
                 max_height=max_height,
+                resize_mode=resize_mode,
             )
             log.info(
-                "[InfiniteTalk] Auto target size %sx%s (max %sx%s, aligned to 16)",
+                "[InfiniteTalk] Auto target size %sx%s (max %sx%s, resize_mode=%s, aligned to 16)",
                 target_width,
                 target_height,
                 max_width,
                 max_height,
+                resize_mode,
             )
             log.info("[InfiniteTalk] Work directory: %s", work_dir)
+            log.info(
+                "[InfiniteTalk] Inputs video=%s audio=%s output=%s keep_intermediates=%s",
+                resolved_video_path,
+                resolved_audio_path,
+                final_output_path,
+                bool(keep_intermediates),
+            )
+            log.info(
+                "[InfiniteTalk] Models wan=%s infinitetalk=%s lora=%s vae=%s text=%s clip=%s wav2vec=%s",
+                wan_model,
+                infinitetalk_model,
+                lora_model,
+                vae_model,
+                text_encoder_model,
+                clip_vision_model,
+                wav2vec_model,
+            )
+            _warn_reference_model_mismatch("lora_model", lora_model)
+            _warn_reference_model_mismatch("vae_model", vae_model)
+            _warn_reference_model_mismatch("text_encoder_model", text_encoder_model)
+            log.info(
+                "[InfiniteTalk] Runtime options attention=%s quantization=%s precision=%s vae_precision=%s text_precision=%s scheduler=%s steps=%s cfg=%.3f shift=%.3f seed=%s start_step=%s end_step=%s",
+                attention_mode,
+                quantization,
+                base_precision,
+                vae_precision,
+                text_precision,
+                scheduler,
+                steps,
+                cfg,
+                shift,
+                seed,
+                start_step,
+                end_step,
+            )
+            log.info(
+                "[InfiniteTalk] Segment options target=%sx%s fps=%.3f resize_mode=%s resize_filter=%s segment_seconds=%.3f frame_window=%s motion_frame=%s block_swap=%s tiled_encode=%s tiled_decode=%s video_codec=%s video_crf=%s",
+                target_width,
+                target_height,
+                target_fps,
+                resize_mode,
+                resize_filter,
+                segment_seconds,
+                frame_window_size,
+                motion_frame,
+                block_swap,
+                bool(encode_tiled_vae),
+                bool(decode_tiled_vae),
+                video_codec,
+                video_crf,
+            )
 
             prepared_audio_path = os.path.join(work_dir, "input_audio.wav")
-            if str(audio_path or "").strip():
-                resolved_audio_path = resolve_user_path(audio_path, "audio_path")
-                with _timed_log(
-                    "Prepare audio",
-                    source="audio_path",
-                    path=resolved_audio_path,
-                ):
-                    extract_audio_to_wav(resolved_audio_path, prepared_audio_path)
-            elif audio is not None:
-                with _timed_log("Prepare audio", source="AUDIO input"):
-                    save_audio_input(audio, prepared_audio_path)
-            else:
-                with _timed_log(
-                    "Prepare audio",
-                    source="video audio track",
-                    path=resolved_video_path,
-                ):
-                    extract_audio_to_wav(resolved_video_path, prepared_audio_path)
+            with _timed_log(
+                "Prepare audio",
+                source="audio_path",
+                path=resolved_audio_path,
+            ):
+                extract_audio_to_wav(resolved_audio_path, prepared_audio_path)
 
             if separate_vocals:
                 log.info("[InfiniteTalk] Separating vocals from source audio")
@@ -1040,21 +1555,11 @@ class InfiniteTalkVideoPathNode:
                 raise RuntimeError("Resolved output duration is 0. Check the input video and audio.")
 
             total_frames = max(1, int(output_duration * float(target_fps)))
-            segment_frames = max(int(float(segment_seconds) * float(target_fps)), int(frame_window_size))
-            stride_frames = segment_frames - motion_frame
-            if stride_frames <= 0:
-                raise ValueError("segment_seconds is too small for the chosen motion_frame")
-
-            num_segments = max(
-                1,
-                int(math.ceil(max(total_frames - segment_frames, 0) / float(stride_frames))) + 1,
-            )
-            log.info(
-                "[InfiniteTalk] Rendering %s frames in %s segments (segment=%s, overlap=%s)",
-                total_frames,
-                num_segments,
-                segment_frames,
-                motion_frame,
+            # `segment_seconds` is now only used to size the streaming source
+            # latent encode chunks. We keep the historical name so existing
+            # workflows do not break.
+            chunk_frames = normalize_frame_window_size(
+                max(int(float(segment_seconds) * float(target_fps)), int(frame_window_size))
             )
 
             with _timed_log(
@@ -1074,184 +1579,156 @@ class InfiniteTalkVideoPathNode:
                         "clip_vision_model": clip_vision_model,
                         "wav2vec_model": wav2vec_model,
                         "block_swap": block_swap,
-                        "use_non_blocking": True,
-                        "prefetch_blocks": 1,
+                        "use_non_blocking": bool(use_non_blocking),
+                        "prefetch_blocks": prefetch_blocks,
                         "positive_prompt": positive_prompt,
                         "negative_prompt": negative_prompt,
-                        "base_precision": "fp16",
-                        "quantization": "fp8_e4m3fn_scaled",
-                        "attention_mode": "sageattn",
-                        "vae_precision": "bf16",
-                        "text_precision": "bf16",
-                        "text_quantization": "disabled",
-                        "wav2vec_precision": "fp16",
-                        "wav2vec_load_device": "main_device",
-                        "audio_scale": 1.0,
-                        "audio_cfg_scale": 1.0,
-                        "clip_strength_1": 1.0,
-                        "clip_strength_2": 0.7,
-                        "scheduler": "dpm++_sde",
-                        "shift": 11.0,
-                        "tile_x": 272,
-                        "tile_y": 272,
-                        "tile_stride_x": 144,
-                        "tile_stride_y": 128,
-                        "encode_tiled_vae": False,
-                        "decode_tiled_vae": False,
-                        "normalize_loudness": True,
+                        "base_precision": base_precision,
+                        "quantization": quantization,
+                        "attention_mode": attention_mode,
+                        "vae_precision": vae_precision,
+                        "text_precision": text_precision,
+                        "text_quantization": text_quantization,
+                        "wav2vec_precision": wav2vec_precision,
+                        "wav2vec_load_device": wav2vec_load_device,
+                        "audio_scale": audio_scale,
+                        "audio_cfg_scale": audio_cfg_scale,
+                        "clip_strength_1": clip_strength_1,
+                        "clip_strength_2": clip_strength_2,
+                        "clip_use_last_frame": clip_use_last_frame,
+                        "scheduler": scheduler,
+                        "shift": shift,
+                        "end_step": end_step,
+                        "denoise_strength": denoise_strength,
+                        "batched_cfg": bool(batched_cfg),
+                        "rope_function": rope_function,
+                        "add_noise_to_samples": bool(add_noise_to_samples),
+                        "sampler_force_offload": bool(sampler_force_offload),
+                        "tile_x": tile_x,
+                        "tile_y": tile_y,
+                        "tile_stride_x": tile_stride_x,
+                        "tile_stride_y": tile_stride_y,
+                        "encode_tiled_vae": bool(encode_tiled_vae),
+                        "decode_tiled_vae": bool(decode_tiled_vae),
+                        "normalize_loudness": bool(normalize_loudness),
                     }
                 )
 
-            segment_paths = []
-            for segment_index in range(num_segments):
-                _throw_if_interrupted()
-                segment_start_frame = segment_index * stride_frames
-                requested_frames = min(segment_frames, total_frames - segment_start_frame)
-                if requested_frames <= 0:
-                    break
-
-                segment_start_sec = float(segment_start_frame) / float(target_fps)
-                segment_duration_sec = float(requested_frames) / float(target_fps)
-                segment_label = f"{segment_index + 1}/{num_segments}"
-                log.info(
-                    "[InfiniteTalk] Segment %s start_frame=%s requested_frames=%s start_sec=%.3f duration_sec=%.3f",
-                    segment_label,
-                    segment_start_frame,
-                    requested_frames,
-                    segment_start_sec,
-                    segment_duration_sec,
-                )
-
-                with _timed_log(
-                    "Segment video load",
-                    segment=segment_label,
-                    start_frame=segment_start_frame,
-                    frames=requested_frames,
-                    width=int(target_width),
-                    height=int(target_height),
-                    fps=float(target_fps),
-                ):
-                    source_frames = load_video_chunk(
-                        resolved_video_path,
-                        segment_start_frame,
-                        requested_frames,
-                        int(target_width),
-                        int(target_height),
-                        float(target_fps),
-                    )
-                log.info(
-                    "[InfiniteTalk] Segment %s video ready actual_frames=%s tensor_shape=%s",
-                    segment_label,
-                    int(source_frames.shape[0]),
-                    tuple(source_frames.shape),
-                )
-
-                with _timed_log(
-                    "Segment audio load",
-                    segment=segment_label,
-                    start_sec=f"{segment_start_sec:.3f}",
-                    duration_sec=f"{segment_duration_sec:.3f}",
-                    sample_rate=16000,
-                ):
-                    segment_audio = load_audio_segment(
-                        prepared_audio_path,
-                        start_sec=segment_start_sec,
-                        duration_sec=segment_duration_sec,
-                        target_sr=16000,
-                    )
-                log.info(
-                    "[InfiniteTalk] Segment %s audio ready samples=%s waveform_shape=%s",
-                    segment_label,
-                    int(segment_audio["waveform"].shape[-1]),
-                    tuple(segment_audio["waveform"].shape),
-                )
-
-                segment_frames_dir = os.path.join(work_dir, f"segment_{segment_index:04d}_frames")
-                os.makedirs(segment_frames_dir, exist_ok=True)
-
-                with _timed_log(
-                    "Segment render",
-                    segment=segment_label,
-                    input_frames=int(source_frames.shape[0]),
-                    frame_window_size=int(frame_window_size),
-                    motion_frame=motion_frame,
-                    steps=int(steps),
-                    cfg=float(cfg),
-                    seed=int(seed),
-                ):
-                    render_result = engine.render_segment(
-                        source_frames=source_frames,
-                        audio_input=segment_audio,
-                        fps=float(target_fps),
-                        frame_window_size=int(frame_window_size),
-                        motion_frame=motion_frame,
-                        steps=int(steps),
-                        cfg_scale=float(cfg),
-                        seed=int(seed),
-                        segment_output_dir=segment_frames_dir,
-                        start_step=int(start_step),
-                        segment_label=segment_label,
-                    )
-
-                actual_num_frames = min(int(render_result["actual_num_frames"]), int(requested_frames))
-                rendered_frames_dir = str(render_result.get("output_path", "") or segment_frames_dir)
-                skip_start = 0 if segment_index == 0 else min(motion_frame, actual_num_frames)
-                visible_frames = max(0, actual_num_frames - skip_start)
-                log.info(
-                    "[InfiniteTalk] Segment %s render result actual_num_frames=%s skip_start=%s visible_frames=%s output_dir=%s",
-                    segment_label,
-                    actual_num_frames,
-                    skip_start,
-                    visible_frames,
-                    rendered_frames_dir,
-                )
-                if visible_frames <= 0:
-                    log.warning(
-                        "[InfiniteTalk] Segment %s produced no visible frames after overlap trim",
-                        segment_label,
-                    )
-                    continue
-
-                segment_video_path = os.path.join(work_dir, f"segment_{segment_index:04d}.mp4")
-                with _timed_log(
-                    "Segment encode video",
-                    segment=segment_label,
-                    start_number=skip_start,
-                    frame_count=visible_frames,
-                    frames_dir=rendered_frames_dir,
-                    output=segment_video_path,
-                ):
-                    encode_png_sequence_to_video(
-                        rendered_frames_dir,
-                        segment_video_path,
-                        float(target_fps),
-                        start_number=skip_start,
-                        frame_count=visible_frames,
-                    )
-                log.info(
-                    "[InfiniteTalk] Segment %s saved video=%s",
-                    segment_label,
-                    segment_video_path,
-                )
-                segment_paths.append(segment_video_path)
-
-            if not segment_paths:
-                raise RuntimeError("InfiniteTalk did not produce any segment output")
-
             with _timed_log(
-                "Final concat",
-                segments=len(segment_paths),
-                duration_sec=f"{output_duration:.3f}",
-                output=final_output_path,
-            ):
-                concat_segments_with_audio(segment_paths, prepared_audio_path, final_output_path, output_duration)
-            with _timed_log(
-                "Final audio load",
+                "Global audio load",
                 duration_sec=f"{output_duration:.3f}",
                 sample_rate=16000,
             ):
-                output_audio = load_audio_segment(prepared_audio_path, 0.0, output_duration, target_sr=16000)
+                global_audio = load_audio_segment(
+                    prepared_audio_path,
+                    start_sec=0.0,
+                    duration_sec=output_duration,
+                    target_sr=16000,
+                )
+            with _timed_log(
+                "Global wav2vec",
+                frames=total_frames,
+                fps=f"{float(target_fps):.3f}",
+            ):
+                global_multitalk_embeds, _, global_actual_frames = engine._build_multitalk_embeds(
+                    audio_input=global_audio,
+                    num_frames=total_frames,
+                    fps=float(target_fps),
+                )
+            global_actual_frames = max(1, min(total_frames, int(global_actual_frames)))
+            if global_actual_frames != total_frames:
+                log.info(
+                    "[InfiniteTalk] Global wav2vec limited total frames %s -> %s",
+                    total_frames,
+                    global_actual_frames,
+                )
+                total_frames = global_actual_frames
 
+            log.info(
+                "[InfiniteTalk] Streaming source latent encode in chunks of %s frames (total=%s)",
+                chunk_frames,
+                total_frames,
+            )
+
+            full_source_latent, first_frame_pixels, last_frame_pixels = _stream_encode_full_source_latent(
+                engine=engine,
+                video_path=resolved_video_path,
+                total_frames=total_frames,
+                target_width=int(target_width),
+                target_height=int(target_height),
+                target_fps=float(target_fps),
+                resize_mode=resize_mode,
+                resize_filter=resize_filter,
+                chunk_frames=int(chunk_frames),
+            )
+            log.info(
+                "[InfiniteTalk] Full source latent ready shape=%s frames=%s",
+                tuple(full_source_latent.shape),
+                total_frames,
+            )
+
+            with _timed_log(
+                "CLIP vision encode (reference frames)",
+                use_last_frame=bool(clip_use_last_frame),
+            ):
+                # When clip_use_last_frame is True we feed image_1=first,
+                # image_2=last so CLIP captures the source video's overall
+                # appearance. Otherwise image_2 stays None to match the
+                # reference workflow (single-frame CLIP context).
+                if clip_use_last_frame and last_frame_pixels is not None:
+                    clip_input_frames = torch.cat([first_frame_pixels, last_frame_pixels], dim=0)
+                else:
+                    clip_input_frames = first_frame_pixels
+                clip_embeds, clip_first_frame = engine.encode_clip_vision_for_first_frame(
+                    clip_input_frames
+                )
+
+            frames_dir = os.path.join(work_dir, "rendered_frames")
+            os.makedirs(frames_dir, exist_ok=True)
+
+            with _timed_log(
+                "Full render (single sampler, sliding window inside)",
+                input_frames=total_frames,
+                frame_window_size=int(frame_window_size),
+                motion_frame=motion_frame,
+                steps=int(steps),
+                cfg=float(cfg),
+                seed=int(seed),
+            ):
+                render_result = engine.render_full_video(
+                    first_frame=clip_first_frame,
+                    clip_embeds=clip_embeds,
+                    source_latent=full_source_latent,
+                    multitalk_embeds=global_multitalk_embeds,
+                    actual_num_frames=total_frames,
+                    fps=float(target_fps),
+                    frame_window_size=int(frame_window_size),
+                    motion_frame=int(motion_frame),
+                    steps=int(steps),
+                    cfg_scale=float(cfg),
+                    seed=int(seed),
+                    output_dir=frames_dir,
+                    start_step=int(start_step),
+                    target_width=int(target_width),
+                    target_height=int(target_height),
+                )
+
+            rendered_frames_dir = str(render_result.get("output_path", "") or frames_dir)
+            with _timed_log(
+                "Final encode (PNG sequence -> mp4 + audio)",
+                frames_dir=rendered_frames_dir,
+                output=final_output_path,
+                duration_sec=f"{output_duration:.3f}",
+            ):
+                _encode_full_video_with_audio(
+                    rendered_frames_dir,
+                    prepared_audio_path,
+                    final_output_path,
+                    target_fps=float(target_fps),
+                    duration=output_duration,
+                    video_codec=video_codec,
+                    video_crf=video_crf,
+                )
             preview_entry = build_output_file_ui_entry(final_output_path)
             log.info("[InfiniteTalk] Final output ready: %s", final_output_path)
             success = True
@@ -1262,14 +1739,12 @@ class InfiniteTalkVideoPathNode:
                 },
                 "result": (
                     final_output_path,
-                    output_filename,
-                    output_audio,
                 ),
             }
         finally:
             if engine is not None:
                 engine.unload()
-            if success and not keep_intermediates:
+            if _should_cleanup_work_dir(keep_intermediates):
                 shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -1279,10 +1754,19 @@ class InfiniteTalkVideoSyncPreview:
         return {
             "required": {
                 "video_path": ("STRING", {"default": ""}),
-                "segment_seconds": ("FLOAT", {"default": 20.0}),
+                "segment_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 20.0,
+                        "tooltip": "Hint for inner sampler-window framing only. The pipeline now uses one continuous multitalk_loop instead of outer segment splicing.",
+                    },
+                ),
                 "target_fps": ("FLOAT", {"default": 25.0}),
                 "motion_frame": ("INT", {"default": 9}),
-            }
+            },
+            "optional": {
+                "frame_window_size": ("INT", {"default": 81, "min": 5, "max": 241, "step": 4}),
+            },
         }
 
     RETURN_TYPES = ("INT", "INT", "FLOAT", "FLOAT", "INT", "STRING")
@@ -1290,27 +1774,61 @@ class InfiniteTalkVideoSyncPreview:
     FUNCTION = "preview"
     CATEGORY = "InfiniteTalk"
 
-    def preview(self, video_path, segment_seconds, target_fps, motion_frame):
+    def preview(self, video_path, segment_seconds, target_fps, motion_frame, frame_window_size=81):
         try:
             resolved_video_path = resolve_user_path(video_path, "video_path")
         except Exception as exc:
             return (0, 0, 0.0, 0.0, 0, str(exc))
 
+        target_fps = _coerce_float_value(target_fps, "target_fps", 25.0, min_value=1.0, max_value=60.0)
+        segment_seconds = _coerce_float_value(
+            segment_seconds,
+            "segment_seconds",
+            20.0,
+            min_value=4.0,
+            max_value=120.0,
+        )
+        motion_frame = _coerce_int_value(
+            motion_frame,
+            "motion_frame",
+            9,
+            min_value=1,
+            max_value=240,
+        )
+        frame_window_size = normalize_frame_window_size(
+            _coerce_int_value(
+                frame_window_size,
+                "frame_window_size",
+                81,
+                min_value=5,
+                max_value=241,
+            )
+        )
+
         info = get_video_info(resolved_video_path)
         total_frames = max(1, int(info["duration"] * float(target_fps)))
-        segment_frames = max(int(float(segment_seconds) * float(target_fps)), 81)
-        stride = segment_frames - int(motion_frame)
-        num_segments = max(1, int(math.ceil(max(total_frames - segment_frames, 0) / float(stride))) + 1)
+        segment_frames = max(int(float(segment_seconds) * float(target_fps)), int(frame_window_size))
+        if motion_frame >= segment_frames:
+            clamped_motion = max(1, segment_frames - 1)
+            log.warning(
+                "[InfiniteTalk] motion_frame=%s >= segment_frames=%s, clamped to %s for preview",
+                motion_frame,
+                segment_frames,
+                clamped_motion,
+            )
+            motion_frame = clamped_motion
+        stride = max(1, frame_window_size - int(motion_frame))
+        num_segments = max(1, int(math.ceil(max(total_frames - frame_window_size, 0) / float(stride))) + 1)
 
-        ram_per_segment_mb = (
-            segment_frames * info["width"] * info["height"] * 3 * 4 / 1024 / 1024
+        ram_window_mb = (
+            frame_window_size * info["width"] * info["height"] * 3 * 4 / 1024 / 1024
         )
 
         text = (
             f"source: {info['width']}x{info['height']} @ {info['fps']:.3f}fps\n"
             f"duration: {info['duration']:.3f}s ({total_frames} frames @ {target_fps}fps)\n"
-            f"segments: {num_segments} x {segment_seconds:.1f}s with {motion_frame} overlap frames\n"
-            f"estimated frame RAM/segment: {ram_per_segment_mb:.0f} MB"
+            f"segments: {num_segments} inner sampler windows ({frame_window_size} frames each, {motion_frame} overlap)\n"
+            f"estimated frame RAM/window: {ram_window_mb:.0f} MB"
         )
 
         return (

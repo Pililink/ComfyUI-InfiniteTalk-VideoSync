@@ -1944,12 +1944,10 @@ class InfiniteTalkVideoSyncPreview:
 
 NODE_CLASS_MAPPINGS = {
     "InfiniteTalkVideoPathNode": InfiniteTalkVideoPathNode,
-    "InfiniteTalkVideoSync": InfiniteTalkVideoPathNode,
     "InfiniteTalkVideoSyncPreview": InfiniteTalkVideoSyncPreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InfiniteTalkVideoPathNode": "InfiniteTalk Lip Sync (Video Path)",
-    "InfiniteTalkVideoSync": "InfiniteTalk Lip Sync (Video Path)",
     "InfiniteTalkVideoSyncPreview": "InfiniteTalk Video Info Preview",
 }

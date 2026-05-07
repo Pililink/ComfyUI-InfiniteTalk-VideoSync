@@ -470,6 +470,24 @@ class NodeBehaviorTests(unittest.TestCase):
         self.assertIn("831", msg)
         self.assertIn("25", msg)
 
+    def test_no_duplicate_node_registration(self):
+        """ComfyUI lists each NODE_CLASS_MAPPINGS key in the search palette;
+        registering the same class under two keys (with the same display name)
+        used to surface the lip-sync node twice. Keep one canonical key only.
+        """
+        nodes = import_under_test("nodes")
+
+        classes = list(nodes.NODE_CLASS_MAPPINGS.values())
+        # Each class registered exactly once.
+        self.assertEqual(len(classes), len(set(map(id, classes))))
+        # Each display name unique.
+        display_values = list(nodes.NODE_DISPLAY_NAME_MAPPINGS.values())
+        self.assertEqual(len(display_values), len(set(display_values)))
+        # Canonical key still present.
+        self.assertIn("InfiniteTalkVideoPathNode", nodes.NODE_CLASS_MAPPINGS)
+        # Old alias removed.
+        self.assertNotIn("InfiniteTalkVideoSync", nodes.NODE_CLASS_MAPPINGS)
+
     def test_pipeline_no_longer_relies_on_outer_segment_concat(self):
         """Refactor invariant: process() must not call concat_segments_with_audio."""
         nodes = import_under_test("nodes")

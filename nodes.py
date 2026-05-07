@@ -688,16 +688,32 @@ def extract_audio_to_wav(media_path, target_audio_path):
     return target_audio_path
 
 
-def normalize_source_video_to_cfr(src_path, dst_path, target_fps, video_codec="libx264", video_crf=18):
-    """Re-encode `src_path` to a CFR file at exactly `target_fps`.
+def normalize_source_video_to_cfr(
+    src_path,
+    dst_path,
+    target_fps,
+    video_codec="libx264",
+    video_crf=18,
+    pad_to_seconds=None,
+):
+    """Re-encode `src_path` to a CFR file at exactly `target_fps` and
+    optionally extend it with cloned last frame to `pad_to_seconds`.
 
-    InfiniteTalk needs every output frame to have a real source frame to
-    follow. Many web/mobile videos report `r_frame_rate=25` but are actually
-    VFR or use 24.97x average fps; once `fps=25` is applied at decode time
-    they end up shorter than `duration * 25`. Running them through this
-    normalize step (`-r target_fps -vsync cfr`) duplicates/drops frames as
-    needed so the produced file's frame count is exactly
-    `round(duration * target_fps)`.
+    Why this is the default in process():
+
+    - Many web/mobile videos lie in their container metadata. ffprobe
+      reports e.g. `r_frame_rate=25, duration=33.28s` but the file is
+      actually VFR or only contains ~31.92s of real frames. This pass
+      runs `-r target_fps -vsync cfr` so the output's frame count is
+      exactly `round(duration * target_fps)` regardless of the source's
+      header.
+    - When the audio is longer than the resulting video, we want the
+      tail of the rendered output to hold on the last source frame
+      rather than fail the run. That's what `tpad=stop_mode=clone` does:
+      it clones the last frame indefinitely; combined with `-t` the
+      muxer trims to exactly `pad_to_seconds`. The user picks this
+      behavior; v2v fidelity is preserved up to the source's natural
+      end and the rest is a static still.
     """
     ffmpeg = get_ffmpeg_path()
     encode_args = get_ffmpeg_video_encode_args(video_codec, video_crf)
@@ -709,12 +725,29 @@ def normalize_source_video_to_cfr(src_path, dst_path, target_fps, video_codec="l
         "error",
         "-i",
         src_path,
-        "-r",
-        str(float(target_fps)),
-        "-vsync",
-        "cfr",
-        "-an",
     ]
+    if pad_to_seconds is not None and float(pad_to_seconds) > 0:
+        # tpad's stop_duration is *additional* time appended after EOF; we
+        # set it generously and rely on `-t` to clip the output to exactly
+        # the requested length, so we don't need to know the source's true
+        # duration up front.
+        command.extend(
+            [
+                "-vf",
+                f"tpad=stop_mode=clone:stop_duration={float(pad_to_seconds):.6f}",
+                "-t",
+                f"{float(pad_to_seconds):.6f}",
+            ]
+        )
+    command.extend(
+        [
+            "-r",
+            str(float(target_fps)),
+            "-vsync",
+            "cfr",
+            "-an",
+        ]
+    )
     command.extend(encode_args)
     command.extend(["-movflags", "+faststart", dst_path])
     _run_command(
@@ -1385,7 +1418,7 @@ class InfiniteTalkVideoPathNode:
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "Re-encode the source video to constant target_fps before sampling. Recommended ON: many phone/web videos report r_frame_rate=25 but are actually VFR, which would otherwise produce fewer decoded frames than the audio needs.",
+                        "tooltip": "Re-encode the source to constant target_fps and clone the last frame to match the audio length. Recommended ON: handles VFR / mis-tagged r_frame_rate sources, and lets a slightly-too-short video still render (the tail holds on the last frame). Turn OFF only when the source is already exact-length CFR and you want to skip the transcode.",
                     },
                 ),
                 "keep_intermediates": ("BOOLEAN", {"default": False}),
@@ -1687,33 +1720,32 @@ class InfiniteTalkVideoPathNode:
                     "Resolved input duration is 0. Check the input video and audio."
                 )
 
-            # Hard contract: the source video must be at least as long as the
-            # audio. The whole point of v2v lip-sync is that every output frame
-            # has a real source frame to follow; if we let the audio run past
-            # the video we would have to pad with the last frame, which violates
-            # the "follow the source motion" guarantee.
-            duration_tolerance = 0.05  # seconds; small buffer for muxer rounding
-            if audio_duration > video_duration + duration_tolerance:
-                raise RuntimeError(
-                    "Source video is shorter than the audio: "
-                    f"video={video_duration:.3f}s, audio={audio_duration:.3f}s. "
-                    "Trim the audio or extend the video to be >= audio length."
-                )
-
             output_duration = float(audio_duration)
             total_frames = max(1, int(round(output_duration * float(target_fps))))
 
-            # Re-encode the source to constant target_fps so the decoded frame
-            # count matches `total_frames` exactly. This is a no-op for true
-            # CFR sources (still costs a transcode pass, but avoids surprises
-            # when phone/web videos lie about r_frame_rate).
+            # Always normalize the source to CFR + pad to audio length when
+            # auto_normalize_fps is on. This handles two failure modes in one
+            # pass: (1) phone/web videos that lie about r_frame_rate and would
+            # otherwise decode to fewer frames than total_frames; (2) sources
+            # whose true content is shorter than the audio - the tail is
+            # extended by cloning the last frame so v2v animation falls back
+            # to a still on the held frame instead of erroring out.
             if bool(auto_normalize_fps):
                 normalized_path = os.path.join(work_dir, "normalized_source.mp4")
+                if audio_duration > video_duration + 0.05:
+                    log.warning(
+                        "[InfiniteTalk] Source video (%.3fs) is shorter than the audio (%.3fs). "
+                        "Last frame will be cloned for the trailing %.3fs.",
+                        video_duration,
+                        audio_duration,
+                        audio_duration - video_duration,
+                    )
                 with _timed_log(
                     "Normalize source to CFR",
                     src=resolved_video_path,
                     dst=normalized_path,
                     target_fps=float(target_fps),
+                    pad_to_seconds=f"{output_duration:.3f}",
                 ):
                     normalize_source_video_to_cfr(
                         resolved_video_path,
@@ -1721,6 +1753,7 @@ class InfiniteTalkVideoPathNode:
                         target_fps=float(target_fps),
                         video_codec=video_codec,
                         video_crf=18,
+                        pad_to_seconds=output_duration,
                     )
                 resolved_video_path = normalized_path
                 normalized_info = get_video_info(resolved_video_path)
@@ -1734,10 +1767,19 @@ class InfiniteTalkVideoPathNode:
                 )
                 if normalized_nb_frames and normalized_nb_frames < total_frames:
                     raise RuntimeError(
-                        f"Normalized video has {normalized_nb_frames} frames at "
-                        f"{target_fps}fps but {total_frames} are required. "
-                        "The original video duration is too short for the audio "
-                        "after rounding; trim the audio or extend the video."
+                        f"Normalized video produced only {normalized_nb_frames} frames "
+                        f"at {target_fps}fps but {total_frames} are required. "
+                        "tpad clone failed; please file a bug with the source video."
+                    )
+            else:
+                # No auto_normalize_fps: enforce the strict contract so the
+                # streaming encoder doesn't silently underflow.
+                if audio_duration > video_duration + 0.05:
+                    raise RuntimeError(
+                        "Source video is shorter than the audio: "
+                        f"video={video_duration:.3f}s, audio={audio_duration:.3f}s. "
+                        "Enable auto_normalize_fps to auto-pad with the last frame, "
+                        "trim the audio, or extend the video."
                     )
             # `segment_seconds` is now only used to size the streaming source
             # latent encode chunks. We keep the historical name so existing

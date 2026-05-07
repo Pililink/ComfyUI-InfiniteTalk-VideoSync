@@ -507,6 +507,44 @@ class NodeBehaviorTests(unittest.TestCase):
         self.assertIn("-vsync cfr", joined)
         self.assertIn("-an", joined)
         self.assertEqual("dst.mp4", captured["command"][-1])
+        # Without pad_to_seconds the command must not include a tpad filter.
+        self.assertNotIn("tpad=", joined)
+        self.assertNotIn(" -t ", " " + joined + " ")
+
+    def test_normalize_with_pad_uses_tpad_clone_and_t_clip(self):
+        """When pad_to_seconds is set, the source's last frame must be cloned
+        to extend the video, and `-t` must clip the muxer to that exact
+        duration. This is the behaviour that lets a slightly-short source
+        render against a longer audio track without the run aborting."""
+        nodes = import_under_test("nodes")
+        captured = {}
+
+        def fake_run(command, error_message, text=False):
+            captured["command"] = list(command)
+            return b""
+
+        original_run = nodes._run_command
+        original_ffmpeg = nodes.get_ffmpeg_path
+        nodes._run_command = fake_run
+        nodes.get_ffmpeg_path = lambda: "ffmpeg"
+        try:
+            nodes.normalize_source_video_to_cfr(
+                "src.mp4",
+                "dst.mp4",
+                target_fps=25.0,
+                video_codec="libx264",
+                video_crf=18,
+                pad_to_seconds=33.28,
+            )
+        finally:
+            nodes._run_command = original_run
+            nodes.get_ffmpeg_path = original_ffmpeg
+
+        joined = " ".join(captured["command"])
+        self.assertIn("tpad=stop_mode=clone:stop_duration=33.280000", joined)
+        self.assertIn("-t 33.280000", joined)
+        self.assertIn("-r 25.0", joined)
+        self.assertIn("-vsync cfr", joined)
 
     def test_no_duplicate_node_registration(self):
         """ComfyUI lists each NODE_CLASS_MAPPINGS key in the search palette;

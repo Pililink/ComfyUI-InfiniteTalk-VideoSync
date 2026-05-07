@@ -414,6 +414,135 @@ def _coerce_float_value(value, field_name, default, min_value=None, max_value=No
     return parsed
 
 
+def _build_full_pipe_command(
+    video_path,
+    target_width,
+    target_height,
+    target_fps,
+    resize_mode,
+    resize_filter,
+    max_total_frames,
+):
+    ffmpeg = get_ffmpeg_path()
+    base_filter = build_video_filter(target_width, target_height, target_fps, resize_mode, resize_filter)
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+        "-vf",
+        base_filter,
+        "-vsync",
+        "cfr",
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+    ]
+    if max_total_frames is not None and max_total_frames > 0:
+        command.extend(["-frames:v", str(int(max_total_frames))])
+    command.append("pipe:1")
+    return command
+
+
+def stream_video_frame_chunks(
+    video_path,
+    target_width,
+    target_height,
+    target_fps,
+    resize_mode="crop_to_size",
+    resize_filter="lanczos",
+    max_total_frames=None,
+    chunk_frames=81,
+):
+    """Yield successive chunks of decoded frames as `[T, H, W, 3]` float32
+    tensors.
+
+    A *single* ffmpeg subprocess decodes the file linearly with the requested
+    fps + scale filter. Chunks are sliced from the rawvideo stdout stream by
+    byte count, so the frame indices observed by the consumer match exactly
+    the indices used to slice the global wav2vec embeddings - no `-ss` /
+    `select` games, no per-chunk redecode, no GOP-boundary drift. When the
+    source video ends before `max_total_frames` the generator simply stops.
+    """
+    target_width = int(target_width)
+    target_height = int(target_height)
+    chunk_frames = max(1, int(chunk_frames))
+    frame_size = target_width * target_height * 3
+
+    command = _build_full_pipe_command(
+        video_path,
+        target_width,
+        target_height,
+        target_fps,
+        resize_mode,
+        resize_filter,
+        max_total_frames,
+    )
+    log.info("[InfiniteTalk] Streaming source video via single ffmpeg pipe (max_frames=%s)", max_total_frames)
+
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    delivered_frames = 0
+    try:
+        while True:
+            _throw_if_interrupted()
+            if max_total_frames is not None and delivered_frames >= max_total_frames:
+                break
+            want_frames = chunk_frames
+            if max_total_frames is not None:
+                want_frames = min(want_frames, max_total_frames - delivered_frames)
+            want_bytes = frame_size * want_frames
+            buffer = bytearray()
+            while len(buffer) < want_bytes:
+                read_size = want_bytes - len(buffer)
+                more = proc.stdout.read(read_size)
+                if not more:
+                    break
+                buffer.extend(more)
+            actual_frames = len(buffer) // frame_size
+            if actual_frames == 0:
+                break
+            valid = bytes(buffer[: actual_frames * frame_size])
+            del buffer
+            arr = np.frombuffer(valid, dtype=np.uint8).reshape(
+                actual_frames, target_height, target_width, 3
+            )
+            tensor = torch.tensor(arr, dtype=torch.float32).div_(255.0)
+            del arr, valid
+            delivered_frames += actual_frames
+            yield tensor
+            if actual_frames < want_frames:
+                # ffmpeg returned a short read; the source is exhausted.
+                break
+    finally:
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            stderr_bytes = proc.stderr.read() if proc.stderr is not None else b""
+        except Exception:
+            stderr_bytes = b""
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+            proc.wait()
+        if proc.returncode not in (0, None) and delivered_frames == 0:
+            details = stderr_bytes.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(
+                f"ffmpeg failed for {video_path}: {details or 'no output'}"
+            )
+
+
 def load_video_chunk(
     video_path,
     start_frame,
@@ -424,94 +553,48 @@ def load_video_chunk(
     resize_mode="crop_to_size",
     resize_filter="lanczos",
 ):
-    """Decode an exact frame range from `video_path`.
+    """Decode `num_frames` frames starting at `start_frame` (in the resampled
+    target_fps timeline) and return them as a `[T, H, W, 3]` float32 tensor.
 
-    Frames are addressed in the resampled `target_fps` timeline so the indices
-    line up 1:1 with the global wav2vec embeddings used by InfiniteTalk. We
-    apply the fps + scale filter first and then `select`/`trim` by frame
-    number, which guarantees the first decoded frame is exactly
-    `start_frame` in the resampled timeline regardless of the source GOP
-    structure (input `-ss` would jump to the nearest keyframe and silently
-    drift the audio/video alignment).
+    Implemented on top of `stream_video_frame_chunks` so that there is one
+    code path for "give me frames N..M" regardless of whether the caller
+    needs the whole video (streaming long encode) or just a slice (preview).
+    The decoder runs a single ffmpeg pass and discards the leading
+    `start_frame` frames in Python land - this is O(start_frame) decode but
+    perfectly accurate at any GOP structure, unlike `-ss` + `select`.
     """
-    ffmpeg = get_ffmpeg_path()
     start_frame = max(0, int(start_frame))
     num_frames = max(1, int(num_frames))
-    end_frame = start_frame + num_frames
-    base_filter = build_video_filter(target_width, target_height, target_fps, resize_mode, resize_filter)
-    select_filter = (
-        f"select='between(n,{start_frame},{end_frame - 1})',setpts=PTS-STARTPTS"
-    )
-    video_filter = f"{base_filter},{select_filter}"
-
-    # Coarse `-ss` *before* `-i` is OK because we still re-select by frame
-    # number after the fps filter; it just trims the keyframe seek window
-    # for performance. Land 2 seconds before our target to leave room for
-    # GOP boundaries.
-    seek_buffer_seconds = 2.0
-    coarse_seek = max(0.0, float(start_frame) / float(target_fps) - seek_buffer_seconds)
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-    ]
-    if coarse_seek > 0.0:
-        command.extend(["-ss", f"{coarse_seek:.6f}"])
-    command.extend(
-        [
-            "-i",
-            video_path,
-            "-vf",
-            video_filter,
-            "-vsync",
-            "cfr",
-            "-frames:v",
-            str(num_frames),
-            "-pix_fmt",
-            "rgb24",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ]
-    )
-    raw = _run_command(command, f"Failed to load video frames from {video_path}", text=False)
-    if not raw and coarse_seek > 0.0:
-        log.warning(
-            "[InfiniteTalk] Empty decode with coarse seek=%.3f, retrying without pre-seek",
-            coarse_seek,
-        )
-        retry_command = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            video_path,
-            "-vf",
-            video_filter,
-            "-vsync",
-            "cfr",
-            "-frames:v",
-            str(num_frames),
-            "-pix_fmt",
-            "rgb24",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ]
-        raw = _run_command(retry_command, f"Failed to load video frames from {video_path}", text=False)
-    if not raw:
+    needed_total = start_frame + num_frames
+    chunk_frames = min(num_frames, 81)
+    collected = []
+    consumed = 0
+    for chunk in stream_video_frame_chunks(
+        video_path,
+        target_width=target_width,
+        target_height=target_height,
+        target_fps=target_fps,
+        resize_mode=resize_mode,
+        resize_filter=resize_filter,
+        max_total_frames=needed_total,
+        chunk_frames=chunk_frames,
+    ):
+        chunk_size = int(chunk.shape[0])
+        chunk_start = consumed
+        chunk_end = consumed + chunk_size
+        consumed = chunk_end
+        if chunk_end <= start_frame:
+            continue
+        slice_start = max(0, start_frame - chunk_start)
+        slice_end = min(chunk_size, needed_total - chunk_start)
+        if slice_end <= slice_start:
+            continue
+        collected.append(chunk[slice_start:slice_end].clone())
+        if consumed >= needed_total:
+            break
+    if not collected:
         raise RuntimeError(f"ffmpeg returned no frames for {video_path} @ frame {start_frame}")
-
-    frame_size = int(target_width) * int(target_height) * 3
-    actual_frames = len(raw) // frame_size
-    if actual_frames <= 0:
-        raise RuntimeError(f"Decoded frame buffer is empty for {video_path}")
-
-    frames = np.frombuffer(raw[: actual_frames * frame_size], dtype=np.uint8)
-    frames = frames.reshape(actual_frames, int(target_height), int(target_width), 3)
-    return torch.tensor(frames, dtype=torch.float32).div_(255.0)
+    return torch.cat(collected, dim=0)
 
 
 def load_audio_segment(audio_path, start_sec=0.0, duration_sec=None, target_sr=16000):
@@ -760,37 +843,25 @@ def _stream_encode_full_source_latent(
     chunks = []
     first_frame_pixels = None
     last_frame_pixels = None
-    next_start = 0
+    delivered = 0
     chunk_index = 0
-    while next_start < total_frames:
-        _throw_if_interrupted()
-        remaining = total_frames - next_start
-        this_chunk = min(chunk_frames, remaining)
-        if this_chunk > 1 and remaining > chunk_frames:
-            this_chunk = chunk_frames
-
-        with _timed_log(
-            "Source video chunk",
-            chunk=f"{chunk_index + 1}",
-            start_frame=next_start,
-            frames=this_chunk,
-            width=int(target_width),
-            height=int(target_height),
-            fps=float(target_fps),
-            resize_mode=resize_mode,
-            resize_filter=resize_filter,
-        ):
-            source_chunk = load_video_chunk(
-                video_path,
-                next_start,
-                this_chunk,
-                int(target_width),
-                int(target_height),
-                float(target_fps),
-                resize_mode=resize_mode,
-                resize_filter=resize_filter,
-            )
-
+    for source_chunk in stream_video_frame_chunks(
+        video_path,
+        target_width=int(target_width),
+        target_height=int(target_height),
+        target_fps=float(target_fps),
+        resize_mode=resize_mode,
+        resize_filter=resize_filter,
+        max_total_frames=int(total_frames),
+        chunk_frames=int(chunk_frames),
+    ):
+        actual_chunk_frames = int(source_chunk.shape[0])
+        log.info(
+            "[InfiniteTalk] Source video chunk %s ready start_frame=%s frames=%s",
+            chunk_index + 1,
+            delivered,
+            actual_chunk_frames,
+        )
         if first_frame_pixels is None:
             first_frame_pixels = source_chunk[0:1].clone()
         last_frame_pixels = source_chunk[-1:].clone()
@@ -800,12 +871,26 @@ def _stream_encode_full_source_latent(
             label=f"chunk_{chunk_index + 1}",
         )
         chunks.append(latent_chunk)
-        next_start += int(source_chunk.shape[0])
+        delivered += actual_chunk_frames
         chunk_index += 1
         del source_chunk
 
     if not chunks:
         raise RuntimeError("Source video produced no frames")
+
+    if delivered < total_frames:
+        # The duration check at the top of process() lets a few frames of
+        # rounding slack through, but actual decoded frames must cover the
+        # audio one-for-one. If ffmpeg's fps filter dropped frames (common
+        # with mis-tagged VFR sources reporting r_frame_rate=25 but actually
+        # decoding at ~24fps) we surface that here with actionable advice
+        # instead of silently padding.
+        raise RuntimeError(
+            f"Source video produced only {delivered} frames at {target_fps}fps "
+            f"but {total_frames} are required to match the audio. "
+            "The source likely has a variable or mis-tagged frame rate; "
+            f"re-encode it to constant {target_fps}fps before running the node."
+        )
 
     full_latent = torch.cat(chunks, dim=2) if chunks[0].dim() == 5 else torch.cat(chunks, dim=1)
     expected_latent_t = (total_frames - 1) // 4 + 1
@@ -1550,11 +1635,27 @@ class InfiniteTalkVideoPathNode:
                 prepared_audio_path = vocals_path
 
             audio_duration = probe_media_duration(prepared_audio_path, "audio")
-            output_duration = min(float(video_info["duration"]), float(audio_duration))
-            if output_duration <= 0:
-                raise RuntimeError("Resolved output duration is 0. Check the input video and audio.")
+            video_duration = float(video_info["duration"])
+            if audio_duration <= 0 or video_duration <= 0:
+                raise RuntimeError(
+                    "Resolved input duration is 0. Check the input video and audio."
+                )
 
-            total_frames = max(1, int(output_duration * float(target_fps)))
+            # Hard contract: the source video must be at least as long as the
+            # audio. The whole point of v2v lip-sync is that every output frame
+            # has a real source frame to follow; if we let the audio run past
+            # the video we would have to pad with the last frame, which violates
+            # the "follow the source motion" guarantee.
+            duration_tolerance = 0.05  # seconds; small buffer for muxer rounding
+            if audio_duration > video_duration + duration_tolerance:
+                raise RuntimeError(
+                    "Source video is shorter than the audio: "
+                    f"video={video_duration:.3f}s, audio={audio_duration:.3f}s. "
+                    "Trim the audio or extend the video to be >= audio length."
+                )
+
+            output_duration = float(audio_duration)
+            total_frames = max(1, int(round(output_duration * float(target_fps))))
             # `segment_seconds` is now only used to size the streaming source
             # latent encode chunks. We keep the historical name so existing
             # workflows do not break.

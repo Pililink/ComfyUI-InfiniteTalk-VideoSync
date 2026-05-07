@@ -333,72 +333,34 @@ class NodeBehaviorTests(unittest.TestCase):
         self.assertTrue(nodes._should_cleanup_work_dir(False))
         self.assertFalse(nodes._should_cleanup_work_dir(True))
 
-    def test_load_video_chunk_uses_exact_frame_select_filter(self):
+    def test_video_pipe_command_is_seek_free_and_cfr(self):
         nodes = import_under_test("nodes")
 
-        captured = {}
-
-        def fake_run(command, error_message, text=False):
-            captured["command"] = list(command)
-            # Return fake raw bytes sized for 1 frame
-            return b"\x00" * (16 * 16 * 3)
-
-        original_run_command = nodes._run_command
         original_get_ffmpeg = nodes.get_ffmpeg_path
-        original_torch = nodes.torch
-        original_np = nodes.np
-
-        # Stub torch + numpy enough to satisfy the array reshape
-        class _FakeTensor:
-            def __init__(self, value):
-                self._value = value
-                self.shape = (1, 16, 16, 3)
-
-            def div_(self, _):
-                return self
-
-        class _FakeArray:
-            def __init__(self):
-                self.size = 16 * 16 * 3
-
-            def reshape(self, *args):
-                return self
-
-        fake_np = types.SimpleNamespace(
-            frombuffer=lambda data, dtype: _FakeArray(),
-            uint8="uint8",
-        )
-        fake_torch = types.SimpleNamespace(
-            tensor=lambda data, dtype=None: _FakeTensor(data),
-            float32="float32",
-        )
-
-        nodes._run_command = fake_run
         nodes.get_ffmpeg_path = lambda: "ffmpeg"
-        nodes.np = fake_np
-        nodes.torch = fake_torch
         try:
-            nodes.load_video_chunk(
+            command = nodes._build_full_pipe_command(
                 "video.mp4",
-                start_frame=100,
-                num_frames=1,
                 target_width=16,
                 target_height=16,
                 target_fps=25.0,
                 resize_mode="crop_to_size",
                 resize_filter="lanczos",
+                max_total_frames=831,
             )
         finally:
-            nodes._run_command = original_run_command
             nodes.get_ffmpeg_path = original_get_ffmpeg
-            nodes.torch = original_torch
-            nodes.np = original_np
 
-        joined = " ".join(captured["command"])
-        # Must contain exact frame-range select filter, not just bare -ss seek.
-        self.assertIn("between(n,100,100)", joined)
-        self.assertIn("setpts=PTS-STARTPTS", joined)
+        joined = " ".join(command)
+        # Streaming pipeline: no -ss anywhere, no select filter, single -i,
+        # CFR locked, frames capped to max_total_frames.
+        self.assertNotIn("-ss", joined)
+        self.assertNotIn("select=", joined)
         self.assertIn("-vsync cfr", joined)
+        self.assertIn("-frames:v 831", joined)
+        self.assertIn("-pix_fmt rgb24", joined)
+        self.assertIn("-f rawvideo", joined)
+        self.assertEqual("pipe:1", command[-1])
 
     def test_chunk_frames_is_normalized_to_4n_plus_1(self):
         nodes = import_under_test("nodes")
@@ -436,6 +398,77 @@ class NodeBehaviorTests(unittest.TestCase):
 
         # Should not error; should report > 0 inner windows.
         self.assertGreater(result[4], 0)
+
+    def test_stream_encode_rejects_video_shorter_than_audio(self):
+        """The hard contract: if the source decodes fewer frames than the
+        audio asks for, the encoder must raise with actionable advice rather
+        than silently padding (which would break v2v motion fidelity)."""
+        nodes = import_under_test("nodes")
+
+        class _FakeChunk:
+            def __init__(self, frames):
+                self._frames = frames
+                self.shape = (frames, 8, 8, 3)
+
+            def __getitem__(self, key):
+                start, stop, _ = (key.start or 0, key.stop or self._frames, 1)
+                length = max(0, stop - start)
+                if start < 0:
+                    length = abs(start)
+                return _FakeChunk(length)
+
+            def clone(self):
+                return _FakeChunk(self._frames)
+
+        class _FakeLatent:
+            def __init__(self, t_latent):
+                self.shape = (1, 16, t_latent, 4, 4)
+
+            def dim(self):
+                return 5
+
+            def contiguous(self):
+                return self
+
+        class _FakeEngine:
+            def encode_source_latent(self, source_chunk, label=""):
+                t_latent = (int(source_chunk.shape[0]) - 1) // 4 + 1
+                return _FakeLatent(t_latent)
+
+        # Stream yields 798 frames total but caller asked for 831 (mirrors the
+        # mis-tagged 25fps video bug we hit in production).
+        def fake_stream(*args, **kwargs):
+            yield _FakeChunk(497)
+            yield _FakeChunk(301)
+
+        original_stream = nodes.stream_video_frame_chunks
+        original_cat = getattr(nodes.torch, "cat", None)
+        nodes.stream_video_frame_chunks = fake_stream
+        nodes.torch.cat = lambda chunks, dim=0: chunks[0]
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                nodes._stream_encode_full_source_latent(
+                    engine=_FakeEngine(),
+                    video_path="video.mp4",
+                    total_frames=831,
+                    target_width=8,
+                    target_height=8,
+                    target_fps=25.0,
+                    resize_mode="crop_to_size",
+                    resize_filter="lanczos",
+                    chunk_frames=497,
+                )
+        finally:
+            nodes.stream_video_frame_chunks = original_stream
+            if original_cat is None:
+                del nodes.torch.cat
+            else:
+                nodes.torch.cat = original_cat
+
+        msg = str(cm.exception)
+        self.assertIn("798", msg)
+        self.assertIn("831", msg)
+        self.assertIn("25", msg)
 
     def test_pipeline_no_longer_relies_on_outer_segment_concat(self):
         """Refactor invariant: process() must not call concat_segments_with_audio."""

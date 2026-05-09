@@ -250,6 +250,26 @@ class NodeBehaviorTests(unittest.TestCase):
         self.assertEqual("Wan2_1_VAE_bf16.safetensors", optional["vae_model"][1]["default"])
         self.assertEqual("umt5-xxl-enc-bf16.safetensors", optional["text_encoder_model"][1]["default"])
 
+    def test_default_clip_vision_prefers_exact_model_over_hash_suffix(self):
+        nodes = import_under_test("nodes")
+        original_get_filename_list = nodes.folder_paths.get_filename_list
+        nodes.folder_paths.get_filename_list = lambda category: {
+            "diffusion_models": ["wan2.1/Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors"],
+            "loras": ["lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors"],
+            "vae": ["Wan2_1_VAE_bf16.safetensors"],
+            "text_encoders": ["umt5-xxl-enc-bf16.safetensors"],
+            "clip_vision": [
+                "clip_vision_h-ba4029076383.safetensors",
+                "clip_vision_h.safetensors",
+            ],
+        }.get(category, [])
+        try:
+            optional = nodes.InfiniteTalkVideoPathNode.INPUT_TYPES()["optional"]
+        finally:
+            nodes.folder_paths.get_filename_list = original_get_filename_list
+
+        self.assertEqual("clip_vision_h.safetensors", optional["clip_vision_model"][1]["default"])
+
     def test_default_lora_prefers_rank128_reference_over_rank64(self):
         nodes = import_under_test("nodes")
         original_get_filename_list = nodes.folder_paths.get_filename_list

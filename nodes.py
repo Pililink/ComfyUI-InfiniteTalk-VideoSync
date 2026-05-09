@@ -1411,12 +1411,23 @@ def _folder_choices(category, preferred_substrings, allow_none=False):
     for substring in preferred_substrings:
         lowered_substring = substring.lower()
         for value, lowered_value in lowered:
-            if lowered_substring in lowered_value:
+            if lowered_value == lowered_substring:
                 default = value
                 break
         else:
             continue
         break
+
+    if default == (values[0] if values else ("none" if allow_none else "")):
+        for substring in preferred_substrings:
+            lowered_substring = substring.lower()
+            for value, lowered_value in lowered:
+                if lowered_substring in lowered_value:
+                    default = value
+                    break
+            else:
+                continue
+            break
 
     if not values:
         values = [default]
@@ -1470,7 +1481,7 @@ class InfiniteTalkVideoPathNode:
         )
         clip_models, clip_default = _folder_choices(
             "clip_vision",
-            ("clip_vision_h",),
+            ("clip_vision_h.safetensors", "clip_vision_h"),
         )
 
         return {

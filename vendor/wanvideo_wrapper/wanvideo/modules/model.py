@@ -3207,6 +3207,10 @@ class WanModel(torch.nn.Module):
                 cuda_stream = None
                 events = None
                 swap_start_idx = len(self.blocks)
+            profile_block_swap = bool(
+                getattr(self, "_infinitetalk_profile_block_swap", False)
+                and self.blocks_to_swap > 0
+            )
 
             # lynx ref
             if lynx_ref_buffer is None and lynx_ref_feature_extractor:
@@ -3243,7 +3247,12 @@ class WanModel(torch.nn.Module):
                         if prefetch_idx < len(self.blocks) and self.blocks_to_swap > 0 and prefetch_idx >= swap_start_idx:
                             context_mgr = torch.cuda.stream(cuda_stream) if torch.cuda.is_available() else nullcontext()
                             with context_mgr:
+                                if profile_block_swap:
+                                    profile_transfer_start = time.perf_counter()
                                 self.blocks[prefetch_idx].to(self.main_device, non_blocking=self.use_non_blocking)
+                                if profile_block_swap:
+                                    self._infinitetalk_block_swap_transfer_time += time.perf_counter() - profile_transfer_start
+                                    self._infinitetalk_block_swap_transfer_count += 1
                                 if events is not None:
                                     events[prefetch_idx].record(cuda_stream)
                 if self.block_swap_debug:
@@ -3252,8 +3261,18 @@ class WanModel(torch.nn.Module):
                 if b >= swap_start_idx and self.blocks_to_swap > 0:
                     if self.prefetch_blocks > 0 and events is not None:
                         if not events[b].query():
+                            if profile_block_swap:
+                                profile_transfer_start = time.perf_counter()
                             events[b].synchronize()
+                            if profile_block_swap:
+                                self._infinitetalk_block_swap_transfer_time += time.perf_counter() - profile_transfer_start
+                                self._infinitetalk_block_swap_transfer_count += 1
+                    if profile_block_swap:
+                        profile_transfer_start = time.perf_counter()
                     block.to(self.main_device)
+                    if profile_block_swap:
+                        self._infinitetalk_block_swap_transfer_time += time.perf_counter() - profile_transfer_start
+                        self._infinitetalk_block_swap_transfer_count += 1
                 if self.block_swap_debug:
                     transfer_end = time.perf_counter()
                     transfer_time = transfer_end - transfer_start
@@ -3295,7 +3314,12 @@ class WanModel(torch.nn.Module):
                     compute_time = compute_end - compute_start
                     to_cpu_transfer_start = time.perf_counter()
                 if b >= swap_start_idx and self.blocks_to_swap > 0:
+                    if profile_block_swap:
+                        profile_transfer_start = time.perf_counter()
                     block.to(self.offload_device, non_blocking=self.use_non_blocking)
+                    if profile_block_swap:
+                        self._infinitetalk_block_swap_transfer_time += time.perf_counter() - profile_transfer_start
+                        self._infinitetalk_block_swap_transfer_count += 1
                 if self.block_swap_debug:
                     to_cpu_transfer_end = time.perf_counter()
                     to_cpu_transfer_time = to_cpu_transfer_end - to_cpu_transfer_start

@@ -13,6 +13,7 @@ from ..HuMo.nodes import get_audio_emb_window
 import comfy.model_management as mm
 from tqdm import tqdm
 import copy
+import time
 
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
@@ -174,6 +175,8 @@ def multitalk_loop(self, **kwargs):
     log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
 
     while True: # start video generation iteratively
+        window_started_at = time.perf_counter()
+        window_index = iteration_count + 1
         self.cache_state = [None, None]
 
         if mode == "skyreelsv3" and reference_keyframes is not None:
@@ -411,6 +414,19 @@ def multitalk_loop(self, **kwargs):
         mm.soft_empty_cache()
         gc.collect()
         # sampling loop
+        block_swap_profile_enabled = bool(
+            transformer is not None
+            and block_swap_args is not None
+            and int(block_swap_args.get("blocks_to_swap", 0) or 0) > 0
+        )
+        if block_swap_profile_enabled:
+            transformer._infinitetalk_profile_block_swap = True
+            transformer._infinitetalk_block_swap_transfer_time = 0.0
+            transformer._infinitetalk_block_swap_transfer_count = 0
+        elif transformer is not None:
+            transformer._infinitetalk_profile_block_swap = False
+
+        sampling_started_at = time.perf_counter()
         sampling_pbar = tqdm(total=len(timesteps)-1, desc=f"Sampling audio indices {audio_start_idx}-{audio_end_idx}", position=0, leave=True)
         for i in range(len(timesteps)-1):
             timestep = timesteps[i]
@@ -463,6 +479,13 @@ def multitalk_loop(self, **kwargs):
                 if humo_image_cond is None or not is_first_clip:
                     latent[:, :cur_motion_frames_latent_num] = latent_motion_frames
 
+        sampling_pbar.close()
+        sampling_sec = time.perf_counter() - sampling_started_at
+        block_swap_transfer_sec = float(getattr(transformer, "_infinitetalk_block_swap_transfer_time", 0.0) or 0.0)
+        block_swap_transfer_count = int(getattr(transformer, "_infinitetalk_block_swap_transfer_count", 0) or 0)
+        if block_swap_profile_enabled:
+            transformer._infinitetalk_profile_block_swap = False
+
         del noise, latent_motion_frames
         if offload:
             offload_transformer(transformer, remove_lora=False)
@@ -470,11 +493,11 @@ def multitalk_loop(self, **kwargs):
         if humo_image_cond is not None and humo_reference_count > 0:
             latent = latent[:,:-humo_reference_count]
 
+        vae_decode_started_at = time.perf_counter()
         vae.to(device)
         videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
         vae.to(offload_device)
-
-        sampling_pbar.close()
+        vae_decode_sec = time.perf_counter() - vae_decode_started_at
 
         # crop drop_frames from end if enabled
         if mode == "skyreelsv3" and drop_frames > 0 and not arrive_last_frame:
@@ -499,17 +522,39 @@ def multitalk_loop(self, **kwargs):
                 videos = torch.stack(cm_result_list, dim=0).permute(3, 0, 1, 2)
 
         # optionally save generated samples to disk
+        frame_save_sec = 0.0
+        saved_frame_count = 0
         if output_path:
+            frame_save_started_at = time.perf_counter()
             video_np = videos.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255).cpu().float().numpy().transpose(1, 2, 3, 0).astype('uint8')
             num_frames_to_save = video_np.shape[0] if is_first_clip else video_np.shape[0] - cur_motion_frames_num
+            saved_frame_count = num_frames_to_save
             log.info(f"Saving {num_frames_to_save} generated frames to {output_path}")
             start_idx = 0 if is_first_clip else cur_motion_frames_num
             for i in range(start_idx, video_np.shape[0]):
                 im = Image.fromarray(video_np[i])
                 im.save(os.path.join(output_path, f"frame_{img_counter:05d}.png"))
                 img_counter += 1
+            frame_save_sec = time.perf_counter() - frame_save_started_at
         else:
             gen_video_list.append(videos if is_first_clip else videos[:, cur_motion_frames_num:])
+
+        log.info(
+            "[MultiTalk] Window timing %s/%s audio=%s-%s frames_saved=%s "
+            "sampling_sec=%.2f vae_decode_sec=%.2f frame_save_sec=%.2f "
+            "block_swap_transfer_sec=%.2f block_swap_transfers=%s total_sec=%.2f",
+            window_index,
+            estimated_iterations,
+            audio_start_idx,
+            audio_end_idx,
+            saved_frame_count,
+            sampling_sec,
+            vae_decode_sec,
+            frame_save_sec,
+            block_swap_transfer_sec,
+            block_swap_transfer_count,
+            time.perf_counter() - window_started_at,
+        )
 
         current_condframe_index += 1
         iteration_count += 1

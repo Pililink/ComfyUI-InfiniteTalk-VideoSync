@@ -650,6 +650,24 @@ class VendorPatchTests(unittest.TestCase):
             text,
         )
 
+    def test_multitalk_loop_logs_per_window_timing(self):
+        loop_path = ROOT / "vendor" / "wanvideo_wrapper" / "multitalk" / "multitalk_loop.py"
+        text = loop_path.read_text(encoding="utf-8")
+
+        self.assertIn("Window timing", text)
+        self.assertIn("sampling_sec=", text)
+        self.assertIn("vae_decode_sec=", text)
+        self.assertIn("frame_save_sec=", text)
+        self.assertIn("block_swap_transfer_sec=", text)
+
+    def test_transformer_accumulates_block_swap_transfer_metrics(self):
+        model_path = ROOT / "vendor" / "wanvideo_wrapper" / "wanvideo" / "modules" / "model.py"
+        text = model_path.read_text(encoding="utf-8")
+
+        self.assertIn("_infinitetalk_profile_block_swap", text)
+        self.assertIn("_infinitetalk_block_swap_transfer_time", text)
+        self.assertIn("_infinitetalk_block_swap_transfer_count", text)
+
 
 if __name__ == "__main__":
     unittest.main()

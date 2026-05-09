@@ -173,6 +173,7 @@ class NodeBehaviorTests(unittest.TestCase):
             "negative_prompt",
             "filename_prefix",
             "output_path",
+            "output_mode",
             "video_codec",
             "video_crf",
             "resize_mode",
@@ -186,10 +187,34 @@ class NodeBehaviorTests(unittest.TestCase):
 
         self.assertEqual("libx264", optional["video_codec"][1]["default"])
         self.assertEqual(19, optional["video_crf"][1]["default"])
+        self.assertEqual("ffmpeg_pipe", optional["output_mode"][1]["default"])
         self.assertEqual(
             ["-c:v", "libx264", "-preset", "medium", "-crf", "19", "-pix_fmt", "yuv420p"],
             nodes.get_ffmpeg_video_encode_args("libx264", 19),
         )
+
+    def test_ffmpeg_pipe_command_accepts_raw_frames_and_audio(self):
+        nodes = import_under_test("nodes")
+
+        command = nodes.build_ffmpeg_pipe_command(
+            audio_path="audio.wav",
+            output_path="out.mp4",
+            target_width=480,
+            target_height=832,
+            target_fps=25.0,
+            duration=227.206,
+            video_codec="libx264",
+            video_crf=19,
+        )
+
+        joined = " ".join(command)
+        self.assertIn("-f rawvideo", joined)
+        self.assertIn("-pix_fmt rgb24", joined)
+        self.assertIn("-s 480x832", joined)
+        self.assertIn("-i pipe:0", joined)
+        self.assertIn("-i audio.wav", joined)
+        self.assertIn("-t 227.206000", joined)
+        self.assertEqual("out.mp4", command[-1])
 
     def test_default_models_prefer_reference_workflow_files(self):
         nodes = import_under_test("nodes")
@@ -667,6 +692,14 @@ class VendorPatchTests(unittest.TestCase):
         self.assertIn("_infinitetalk_profile_block_swap", text)
         self.assertIn("_infinitetalk_block_swap_transfer_time", text)
         self.assertIn("_infinitetalk_block_swap_transfer_count", text)
+
+    def test_multitalk_loop_can_stream_windows_to_output_sink(self):
+        loop_path = ROOT / "vendor" / "wanvideo_wrapper" / "multitalk" / "multitalk_loop.py"
+        text = loop_path.read_text(encoding="utf-8")
+
+        self.assertIn('output_sink = image_embeds.get("output_sink"', text)
+        self.assertIn("output_sink.write_window(", text)
+        self.assertIn("if output_sink is not None:", text)
 
 
 if __name__ == "__main__":

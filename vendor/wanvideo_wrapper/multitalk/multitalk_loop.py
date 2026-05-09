@@ -76,6 +76,7 @@ def multitalk_loop(self, **kwargs):
         original_images = torch.zeros([noise.shape[0], 1, target_h, target_w], device=device)
 
     output_path = image_embeds.get("output_path", "")
+    output_sink = image_embeds.get("output_sink", None)
     img_counter = 0
 
     if len(multitalk_embeds['audio_features'])==2 and (multitalk_embeds['ref_target_masks'] is None):
@@ -524,7 +525,16 @@ def multitalk_loop(self, **kwargs):
         # optionally save generated samples to disk
         frame_save_sec = 0.0
         saved_frame_count = 0
-        if output_path:
+        if output_sink is not None:
+            frame_save_started_at = time.perf_counter()
+            start_idx = 0 if is_first_clip else cur_motion_frames_num
+            output_videos = videos[:, start_idx:]
+            saved_frame_count = int(output_videos.shape[1])
+            written_frame_count = output_sink.write_window(output_videos)
+            if written_frame_count is not None:
+                saved_frame_count = int(written_frame_count)
+            frame_save_sec = time.perf_counter() - frame_save_started_at
+        elif output_path:
             frame_save_started_at = time.perf_counter()
             video_np = videos.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255).cpu().float().numpy().transpose(1, 2, 3, 0).astype('uint8')
             num_frames_to_save = video_np.shape[0] if is_first_clip else video_np.shape[0] - cur_motion_frames_num
@@ -603,7 +613,7 @@ def multitalk_loop(self, **kwargs):
                 miss_length   = 1
                 original_images = torch.cat([original_images, last_frame.repeat(1, 1, miss_length, 1, 1)], dim=2)
 
-    if not output_path:
+    if not output_path and output_sink is None:
         gen_video_samples = torch.cat(gen_video_list, dim=1)
     else:
         gen_video_samples = torch.zeros(3, 1, 64, 64) # dummy output

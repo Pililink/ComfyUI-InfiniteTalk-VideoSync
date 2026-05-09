@@ -508,6 +508,7 @@ class InfiniteTalkEngine:
         start_step,
         target_width,
         target_height,
+        output_sink=None,
     ):
         """Run the multitalk_loop end-to-end against a full-length latent.
 
@@ -515,15 +516,18 @@ class InfiniteTalkEngine:
         with a sliding `frame_window_size` window, injecting the previous
         window's last `motion_frame` latent frames into the next iteration.
         Giving it `output_path` causes each window's decoded frames to land
-        on disk as PNG, so we never hold the whole rendered video in VRAM.
+        on disk as PNG. Giving it `output_sink` streams decoded windows to a
+        caller-owned encoder so we never hold the whole rendered video in VRAM
+        and do not need intermediate PNG files.
         """
+        output_target = output_dir or getattr(output_sink, "output_path", "") or "<memory>"
         log.info(
-            "[InfiniteTalk] Full render start frames=%s fps=%.3f size=%sx%s output_dir=%s",
+            "[InfiniteTalk] Full render start frames=%s fps=%.3f size=%sx%s output_target=%s",
             int(actual_num_frames),
             float(fps),
             int(target_width),
             int(target_height),
-            output_dir or "<memory>",
+            output_target,
         )
 
         with _timed_log(
@@ -550,13 +554,15 @@ class InfiniteTalkEngine:
             )
 
         image_embeds = image_embeds_result[0]
+        if output_sink is not None and isinstance(image_embeds, dict):
+            image_embeds["output_sink"] = output_sink
         actual_output_dir = ""
         if len(image_embeds_result) > 1 and isinstance(image_embeds_result[1], str):
             actual_output_dir = image_embeds_result[1]
         if not actual_output_dir and isinstance(image_embeds, dict):
             actual_output_dir = str(image_embeds.get("output_path", "") or "")
         if not actual_output_dir:
-            actual_output_dir = str(output_dir or "")
+            actual_output_dir = str(output_dir or getattr(output_sink, "output_path", "") or "")
 
         samples_payload = {"samples": source_latent, "noise_mask": None}
 
@@ -593,7 +599,7 @@ class InfiniteTalkEngine:
             )
 
         log.info(
-            "[InfiniteTalk] Full render done output_dir=%s",
+            "[InfiniteTalk] Full render done output_target=%s",
             actual_output_dir,
         )
         return {

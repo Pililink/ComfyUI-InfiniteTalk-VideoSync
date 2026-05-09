@@ -2,6 +2,7 @@ import importlib
 import logging
 import math
 import os
+import queue
 import random
 import re
 import shutil
@@ -40,6 +41,7 @@ DEFAULT_NEGATIVE_PROMPT = (
 RESIZE_MODES = ("crop_to_size", "fit_inside")
 RESIZE_FILTERS = ("nearest-exact", "lanczos", "bicubic", "bilinear", "area")
 VIDEO_CODECS = ("libx264", "h264_nvenc", "h264_qsv", "h264_amf", "auto")
+OUTPUT_MODES = ("ffmpeg_pipe", "png_sequence")
 REFERENCE_WORKFLOW_MODEL_HINTS = {
     "lora_model": ("lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16",),
     "vae_model": ("Wan2_1_VAE_bf16",),
@@ -280,6 +282,17 @@ def _normalize_video_codec(video_codec):
         video_codec,
     )
     return "libx264"
+
+
+def _normalize_output_mode(output_mode):
+    output_mode = str(output_mode or "ffmpeg_pipe").strip()
+    if output_mode in OUTPUT_MODES:
+        return output_mode
+    log.warning(
+        "[InfiniteTalk] Unknown output_mode=%r, fallback to ffmpeg_pipe",
+        output_mode,
+    )
+    return "ffmpeg_pipe"
 
 
 def resolve_target_size(source_width, source_height, max_width=480, max_height=832, resize_mode="crop_to_size"):
@@ -826,6 +839,210 @@ def get_ffmpeg_video_encode_args(codec="libx264", crf=19):
     if codec == "h264_amf":
         return ["-c:v", codec, "-quality", "quality", "-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf), "-pix_fmt", "yuv420p"]
     return ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+
+
+def build_ffmpeg_pipe_command(
+    audio_path,
+    output_path,
+    target_width,
+    target_height,
+    target_fps,
+    duration,
+    video_codec="libx264",
+    video_crf=19,
+):
+    command = [
+        get_ffmpeg_path(),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{int(target_width)}x{int(target_height)}",
+        "-r",
+        str(float(target_fps)),
+        "-i",
+        "pipe:0",
+        "-i",
+        audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-t",
+        f"{float(duration):.6f}",
+    ]
+    command.extend(get_ffmpeg_video_encode_args(video_codec, video_crf))
+    command.extend(["-c:a", "aac", "-movflags", "+faststart", output_path])
+    return command
+
+
+class FfmpegPipeSink:
+    def __init__(
+        self,
+        audio_path,
+        output_path,
+        target_width,
+        target_height,
+        target_fps,
+        duration,
+        video_codec="libx264",
+        video_crf=19,
+        max_queue_windows=1,
+    ):
+        self.output_path = output_path
+        self.command = build_ffmpeg_pipe_command(
+            audio_path=audio_path,
+            output_path=output_path,
+            target_width=target_width,
+            target_height=target_height,
+            target_fps=target_fps,
+            duration=duration,
+            video_codec=video_codec,
+            video_crf=video_crf,
+        )
+        self._queue = queue.Queue(maxsize=max(1, int(max_queue_windows)))
+        self._closed = False
+        self._worker_error = None
+        self._expected_frames = max(1, int(round(float(duration) * float(target_fps))))
+        self._written_frames = 0
+        self._process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self._worker = threading.Thread(
+            target=self._write_worker,
+            name="InfiniteTalkFfmpegPipeSink",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def write_window(self, videos):
+        if self._closed:
+            raise RuntimeError("Cannot write to a closed ffmpeg pipe")
+        self._raise_worker_error()
+        frame_count = int(videos.shape[1])
+        remaining_frames = self._expected_frames - self._written_frames
+        if remaining_frames <= 0 or frame_count <= 0:
+            return 0
+        if frame_count > remaining_frames:
+            videos = videos[:, :remaining_frames]
+            frame_count = int(videos.shape[1])
+        while True:
+            _throw_if_interrupted()
+            self._raise_worker_error()
+            try:
+                self._queue.put(videos, timeout=0.1)
+                self._written_frames += frame_count
+                return frame_count
+            except queue.Full:
+                continue
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            if self._worker.is_alive():
+                self._put_sentinel()
+                self._queue.join()
+            else:
+                self._drain_queue()
+            self._worker.join()
+        self._raise_worker_error()
+
+    def abort(self):
+        self._closed = True
+        self._drain_queue()
+        try:
+            if self._process.poll() is None:
+                self._process.kill()
+        finally:
+            if self._worker.is_alive():
+                self._worker.join(timeout=2.0)
+
+    def _put_sentinel(self):
+        while True:
+            _throw_if_interrupted()
+            self._raise_worker_error()
+            try:
+                self._queue.put(None, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def _write_worker(self):
+        try:
+            while True:
+                videos = self._queue.get()
+                try:
+                    if videos is None:
+                        break
+                    raw_bytes = self._videos_to_raw_rgb_bytes(videos)
+                    if raw_bytes:
+                        self._process.stdin.write(raw_bytes)
+                finally:
+                    self._queue.task_done()
+        except Exception as exc:
+            self._worker_error = exc
+            self._drain_queue()
+            try:
+                if self._process.poll() is None:
+                    self._process.kill()
+            except Exception:
+                pass
+        finally:
+            try:
+                if self._process.stdin:
+                    self._process.stdin.close()
+            except Exception:
+                pass
+
+            return_code = self._process.wait()
+            stderr = b""
+            if self._process.stderr is not None:
+                stderr = self._process.stderr.read() or b""
+            if return_code != 0 and self._worker_error is None:
+                details = stderr.decode("utf-8", errors="ignore").strip()
+                if details:
+                    self._worker_error = RuntimeError(
+                        f"Failed to encode final InfiniteTalk video to {self.output_path}: {details}"
+                    )
+                else:
+                    self._worker_error = RuntimeError(
+                        f"Failed to encode final InfiniteTalk video to {self.output_path} (exit code {return_code})"
+                    )
+
+    def _videos_to_raw_rgb_bytes(self, videos):
+        video_np = (
+            videos.clamp(-1.0, 1.0)
+            .add(1.0)
+            .div(2.0)
+            .mul(255)
+            .cpu()
+            .float()
+            .numpy()
+            .transpose(1, 2, 3, 0)
+            .astype("uint8")
+        )
+        return np.ascontiguousarray(video_np).tobytes()
+
+    def _drain_queue(self):
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self._queue.task_done()
+
+    def _raise_worker_error(self):
+        if self._worker_error is not None:
+            raise self._worker_error
 
 
 def _resolve_frame_sequence_dir(frames_dir):
@@ -1384,6 +1601,7 @@ class InfiniteTalkVideoPathNode:
                 "tile_stride_y": ("INT", {"default": 128, "min": 32, "max": 2048, "step": 16}),
                 "filename_prefix": ("STRING", {"default": "InfiniteTalk"}),
                 "output_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Optional output file or directory"}),
+                "output_mode": (list(OUTPUT_MODES), {"default": "ffmpeg_pipe"}),
                 "video_codec": (list(VIDEO_CODECS), {"default": "libx264"}),
                 "video_crf": (
                     "INT",
@@ -1486,6 +1704,7 @@ class InfiniteTalkVideoPathNode:
         tile_stride_y=128,
         filename_prefix="InfiniteTalk",
         output_path="",
+        output_mode="ffmpeg_pipe",
         video_codec="libx264",
         video_crf=19,
         resize_mode="crop_to_size",
@@ -1558,6 +1777,7 @@ class InfiniteTalkVideoPathNode:
         clip_strength_1 = _coerce_float_value(clip_strength_1, "clip_strength_1", 1.0, min_value=0.0, max_value=4.0)
         clip_strength_2 = _coerce_float_value(clip_strength_2, "clip_strength_2", 1.0, min_value=0.0, max_value=4.0)
         video_codec = _normalize_video_codec(video_codec)
+        output_mode = _normalize_output_mode(output_mode)
         video_crf = _coerce_int_value(video_crf, "video_crf", 19, min_value=0, max_value=51)
         clip_use_last_frame = bool(clip_use_last_frame)
         audio_path = str(audio_path or "").strip()
@@ -1593,6 +1813,7 @@ class InfiniteTalkVideoPathNode:
         os.makedirs(work_dir, exist_ok=True)
 
         engine = None
+        output_sink = None
         success = False
 
         try:
@@ -1678,7 +1899,7 @@ class InfiniteTalkVideoPathNode:
                 end_step,
             )
             log.info(
-                "[InfiniteTalk] Segment options target=%sx%s fps=%.3f resize_mode=%s resize_filter=%s segment_seconds=%.3f frame_window=%s motion_frame=%s block_swap=%s tiled_encode=%s tiled_decode=%s video_codec=%s video_crf=%s",
+                "[InfiniteTalk] Segment options target=%sx%s fps=%.3f resize_mode=%s resize_filter=%s segment_seconds=%.3f frame_window=%s motion_frame=%s block_swap=%s tiled_encode=%s tiled_decode=%s output_mode=%s video_codec=%s video_crf=%s",
                 target_width,
                 target_height,
                 target_fps,
@@ -1690,6 +1911,7 @@ class InfiniteTalkVideoPathNode:
                 block_swap,
                 bool(encode_tiled_vae),
                 bool(decode_tiled_vae),
+                output_mode,
                 video_codec,
                 video_crf,
             )
@@ -1910,7 +2132,26 @@ class InfiniteTalkVideoPathNode:
                 )
 
             frames_dir = os.path.join(work_dir, "rendered_frames")
-            os.makedirs(frames_dir, exist_ok=True)
+            render_output_dir = frames_dir if output_mode == "png_sequence" else ""
+            if output_mode == "png_sequence":
+                os.makedirs(frames_dir, exist_ok=True)
+            else:
+                with _timed_log(
+                    "Open ffmpeg pipe output",
+                    output=final_output_path,
+                    duration_sec=f"{output_duration:.3f}",
+                    video_codec=video_codec,
+                ):
+                    output_sink = FfmpegPipeSink(
+                        audio_path=prepared_audio_path,
+                        output_path=final_output_path,
+                        target_width=int(target_width),
+                        target_height=int(target_height),
+                        target_fps=float(target_fps),
+                        duration=output_duration,
+                        video_codec=video_codec,
+                        video_crf=video_crf,
+                    )
 
             with _timed_log(
                 "Full render (single sampler, sliding window inside)",
@@ -1920,6 +2161,7 @@ class InfiniteTalkVideoPathNode:
                 steps=int(steps),
                 cfg=float(cfg),
                 seed=int(seed),
+                output_mode=output_mode,
             ):
                 render_result = engine.render_full_video(
                     first_frame=clip_first_frame,
@@ -1933,28 +2175,38 @@ class InfiniteTalkVideoPathNode:
                     steps=int(steps),
                     cfg_scale=float(cfg),
                     seed=int(seed),
-                    output_dir=frames_dir,
+                    output_dir=render_output_dir,
+                    output_sink=output_sink,
                     start_step=int(start_step),
                     target_width=int(target_width),
                     target_height=int(target_height),
                 )
 
-            rendered_frames_dir = str(render_result.get("output_path", "") or frames_dir)
-            with _timed_log(
-                "Final encode (PNG sequence -> mp4 + audio)",
-                frames_dir=rendered_frames_dir,
-                output=final_output_path,
-                duration_sec=f"{output_duration:.3f}",
-            ):
-                _encode_full_video_with_audio(
-                    rendered_frames_dir,
-                    prepared_audio_path,
-                    final_output_path,
-                    target_fps=float(target_fps),
-                    duration=output_duration,
-                    video_codec=video_codec,
-                    video_crf=video_crf,
-                )
+            if output_mode == "ffmpeg_pipe":
+                with _timed_log(
+                    "Final encode (ffmpeg pipe finalize + audio)",
+                    output=final_output_path,
+                    duration_sec=f"{output_duration:.3f}",
+                ):
+                    output_sink.close()
+                    output_sink = None
+            else:
+                rendered_frames_dir = str(render_result.get("output_path", "") or frames_dir)
+                with _timed_log(
+                    "Final encode (PNG sequence -> mp4 + audio)",
+                    frames_dir=rendered_frames_dir,
+                    output=final_output_path,
+                    duration_sec=f"{output_duration:.3f}",
+                ):
+                    _encode_full_video_with_audio(
+                        rendered_frames_dir,
+                        prepared_audio_path,
+                        final_output_path,
+                        target_fps=float(target_fps),
+                        duration=output_duration,
+                        video_codec=video_codec,
+                        video_crf=video_crf,
+                    )
             preview_entry = build_output_file_ui_entry(final_output_path)
             log.info("[InfiniteTalk] Final output ready: %s", final_output_path)
             success = True
@@ -1968,6 +2220,8 @@ class InfiniteTalkVideoPathNode:
                 ),
             }
         finally:
+            if output_sink is not None:
+                output_sink.abort()
             if engine is not None:
                 engine.unload()
             if _should_cleanup_work_dir(keep_intermediates):
